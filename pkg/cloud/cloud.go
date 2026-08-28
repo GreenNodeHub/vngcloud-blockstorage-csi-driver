@@ -6,8 +6,6 @@ import (
 	"strings"
 
 	ljmath "github.com/cuongpiger/joat/math"
-	lsentity "github.com/vngcloud/vngcloud-blockstorage-csi-driver/pkg/cloud/entity"
-	lserr "github.com/vngcloud/vngcloud-blockstorage-csi-driver/pkg/cloud/errors"
 	lsdkClientV2 "github.com/vngcloud/vngcloud-go-sdk/v2/client"
 	lsdkEntity "github.com/vngcloud/vngcloud-go-sdk/v2/vngcloud/entity"
 	lsdkErrs "github.com/vngcloud/vngcloud-go-sdk/v2/vngcloud/sdk_error"
@@ -17,6 +15,8 @@ import (
 	lsdkVolumeV2 "github.com/vngcloud/vngcloud-go-sdk/v2/vngcloud/services/volume/v2"
 	llog "k8s.io/klog/v2"
 
+	lsentity "github.com/vngcloud/vngcloud-blockstorage-csi-driver/pkg/cloud/entity"
+	lserr "github.com/vngcloud/vngcloud-blockstorage-csi-driver/pkg/cloud/errors"
 	lsutil "github.com/vngcloud/vngcloud-blockstorage-csi-driver/pkg/util"
 )
 
@@ -28,7 +28,11 @@ func NewCloud(iamURL, vserverUrl, clientID, clientSecret string, metadataSvc Met
 		WithIamEndpoint(iamURL).
 		WithVServerEndpoint(vserverUrl)
 
-	cloudClient := lsdkClientV2.NewClient(lctx.TODO()).Configure(clientCfg)
+	// WithHttpClient phai duoc goi TRUOC Configure: Configure chi tu tao http
+	// client khi field con nil (client/client.go).
+	cloudClient := lsdkClientV2.NewClient(lctx.TODO()).
+		WithHttpClient(NewThrottledHTTPClient(lctx.TODO())).
+		Configure(clientCfg)
 
 	llog.V(5).InfoS("[DEBUG] - NodeGetInfo: Get the portal info and quota",
 		"underProjectId", projectID, "iamURL", iamURL, "vserverUrl", vserverUrl, "clientID", clientID)
