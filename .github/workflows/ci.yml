@@ -1,0 +1,89 @@
+name: CI
+
+# Gate duy nhất cho branch protection là job "CI OK" — thêm/bớt job kiểm tra
+# không cần sửa protection settings.
+#
+# Repo này giữ nguyên build_dev.yml / build_prod.yml / release.yml sẵn có cho
+# phần deploy; ci.yml chỉ là cổng chất lượng cho PR vào main.
+#
+# KHÁC control-plane: blockstorage-csi KHÔNG cần github token cho private modules —
+# hai dep vngcloud-go-sdk + vngcloud-csi-volume-modifier đều public và có trên
+# Go proxy, nên go build/vet/test resolve qua proxy mà không cần GOPRIVATE/auth.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Verify build compiles
+        run: go build ./...
+
+      - name: Run go vet
+        run: go vet ./...
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # blockstorage-csi dùng make unit (lọc sanity/tests packages qua sed) thay vì
+      # go test ./... thô — tránh build test binary cho pkg cần deps ngoài.
+      - name: Run tests
+        run: make unit
+
+  lint:
+    # Chỉ chạy trên PR: only-new-issues so diff với merge-base của PR — repo này
+    # còn nhiều issue cũ, gate chỉ chặn code MỚI.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Lint (new issues only)
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.12.2 # pin theo lần chạy xanh đầu tiên (2026-07-29)
+          only-new-issues: true
+
+  ci-ok:
+    name: CI OK
+    # lint chỉ chạy trên pull_request — result "skipped" trên push là hợp lệ;
+    # chỉ fail khi có job failure/cancelled.
+    needs: [build, test, lint]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Verify no required job failed
+        run: |
+          echo '${{ toJson(needs) }}' | jq -e 'all(.[]; .result == "success" or .result == "skipped")' \
+            || { echo "::error::A required CI job failed or was cancelled."; exit 1; }
