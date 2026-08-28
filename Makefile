@@ -67,8 +67,10 @@ $(BUILD_CMDS): $(SOURCES)
 
 test: unit functional
 
+# Cung phien ban voi CI (.github/workflows/ci.yml). .golangci.yml o day la
+# config format v2 nen KHONG chay duoc bang golangci-lint v1.x.
 check: work
-	go run github.com/golangci/golangci-lint/cmd/golangci-lint@v1.56.0 run ./...
+	go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 run ./...
 
 unit: work
 	go test -tags=unit $(shell go list ./... | sed -e '/sanity/ { N; d; }' | sed -e '/tests/ {N; d;}') $(TESTARGS)
