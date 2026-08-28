@@ -111,7 +111,7 @@ var (
 	}
 
 	ErrFailedToValidateVolumeSize = func(pvolumeID string, err error) error {
-		return lstt.Errorf(lcodes.Internal, "CANNOT validate volume size for volume %s: %w", pvolumeID, err)
+		return lstt.Errorf(lcodes.Internal, "CANNOT validate volume size for volume %s: %v", pvolumeID, err)
 	}
 
 	ErrVolumeSizeTooSmall = func(pvolumeID string, psize int64) error {

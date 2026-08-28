@@ -158,12 +158,15 @@ func (h *modifyVolumeRequestHandler) mergeModifyVolumeRequest(r *modifyVolumeReq
 }
 
 func (s *controllerService) executeModifyVolumeRequest(volumeID string, req *modifyVolumeRequest) (int64, error) {
-	_, cancel := context.WithTimeout(context.Background(), DefaultTimeoutModifyChannel)
-	defer func() {
-		klog.Errorf("Cancel has been called for the context.")
-		cancel()
-	}()
-	actualSizeGiB, err := s.cloud.ResizeOrModifyDisk(volumeID, req.newSize, &req.modifyDiskOptions)
+	// Context nay truoc day duoc tao roi bo di (`_, cancel := ...`), nen
+	// DefaultTimeoutModifyChannel khong co tac dung gi. Gio truyen xuong that.
+	// Khong dung ctx cua caller vi mot request da duoc gop tu nhieu caller
+	// (request coalescing); aws-ebs-csi-driver lam y het trong
+	// executeModifyVolumeRequest, chi khac la ho dat 15s con day la 10 phut.
+	ctx, cancel := context.WithTimeout(context.Background(), DefaultTimeoutModifyChannel)
+	defer cancel()
+
+	actualSizeGiB, err := s.cloud.ResizeOrModifyDisk(ctx, volumeID, req.newSize, &req.modifyDiskOptions)
 	if err != nil {
 		klog.ErrorS(err, "Failed to modify volume", "volumeID", volumeID)
 		return 0, err

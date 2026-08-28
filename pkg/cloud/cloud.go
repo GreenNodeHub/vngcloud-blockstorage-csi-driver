@@ -6,8 +6,6 @@ import (
 	"strings"
 
 	ljmath "github.com/cuongpiger/joat/math"
-	ljtime "github.com/cuongpiger/joat/timer"
-	ljwait "github.com/cuongpiger/joat/utils/exponential-backoff"
 	lsentity "github.com/vngcloud/vngcloud-blockstorage-csi-driver/pkg/cloud/entity"
 	lserr "github.com/vngcloud/vngcloud-blockstorage-csi-driver/pkg/cloud/errors"
 	lsdkClientV2 "github.com/vngcloud/vngcloud-go-sdk/v2/client"
@@ -138,218 +136,179 @@ func (s *cloud) GetVolume(volumeID string) (*lsentity.Volume, lserr.IError) {
 	}, nil
 }
 
-func (s *cloud) DeleteVolume(volID string) lserr.IError {
+// DeleteVolume xoa volume, cho toi khi no o trang thai xoa duoc roi moi xoa.
+//
+// Truoc day ham nay ket luan bang bien sentinel `ierr` sau mot vong
+// `_ = ljwait.ExponentialBackoff(...)`: neu volume khong bao gio ve trang thai
+// CanDelete thi het 10 phut `ierr` van nil va ham bao XOA THANH CONG. Khi do
+// external-provisioner xoa luon PV, con volume o lai IaaS vinh vien - khong con
+// object Kubernetes nao tro toi nua, va van tinh tien.
+func (s *cloud) DeleteVolume(pctx lctx.Context, volID string) lserr.IError {
 	llog.InfoS("[INFO] - DeleteVolume: Start deleting the volume", "volumeId", volID)
 
-	var (
-		ierr lserr.IError
-	)
-
-	_ = ljwait.ExponentialBackoff(ljwait.NewBackOff(5, 10, true, ljtime.Minute(10)), func() (bool, error) {
-		vol, sdkErr := s.client.VServerGateway().V2().VolumeService().
-			GetBlockVolumeById(lsdkVolumeV2.NewGetBlockVolumeByIdRequest(volID))
-
-		if sdkErr != nil {
-			if sdkErr.IsError(lsdkErrs.EcVServerVolumeNotFound) {
-				ierr = nil // reset
-				llog.InfoS("[INFO] - DeleteVolume: The volume was deleted before", "volumeId", volID)
-				return true, nil
-			}
-
-			ierr = lserr.ErrVolumeFailedToGet(volID, sdkErr)
-			return false, nil
+	vol, sdkErr := s.getVolumeById(volID)
+	if sdkErr != nil {
+		if sdkErr.IsError(lsdkErrs.EcVServerVolumeNotFound) {
+			llog.InfoS("[INFO] - DeleteVolume: The volume was deleted before", "volumeId", volID)
+			return nil
 		}
 
-		// Check can delete this volume
-		if vol.CanDelete() {
-			llog.InfoS("[INFO] - DeleteVolume: Deleting the volume", "volumeId", volID)
-			if sdkErr = s.client.VServerGateway().V2().VolumeService().
-				DeleteBlockVolumeById(lsdkVolumeV2.NewDeleteBlockVolumeByIdRequest(volID)); sdkErr != nil {
-				if sdkErr.IsError(lsdkErrs.EcVServerVolumeNotFound) {
-					ierr = nil // reset
-					llog.InfoS("[INFO] - DeleteVolume: The volume was deleted before", "volumeId", volID)
-					return true, nil
-				}
-
-				ierr = lserr.ErrVolumeFailedToDelete(volID, sdkErr)
-				llog.ErrorS(ierr.GetError(), "[ERROR] - DeleteVolume: Failed to delete the volume", ierr.GetListParameters()...)
-				return false, nil
-			}
-
-			ierr = nil // reset
-			return true, nil
-		}
-
-		return false, nil
-	})
-
-	if ierr == nil {
-		llog.InfoS("[INFO] - DeleteVolume: Deleted the volume successfully", "volumeId", volID)
-		return nil
+		return lserr.ErrVolumeFailedToGet(volID, sdkErr)
 	}
 
-	return ierr
+	// Cho volume ve trang thai xoa duoc. ctx la deadline.
+	if !vol.CanDelete() {
+		if err := s.waitVolumeDeletable(pctx, volID); err != nil {
+			return err
+		}
+	}
+
+	if sdkErr := s.client.VServerGateway().V2().VolumeService().
+		DeleteBlockVolumeById(lsdkVolumeV2.NewDeleteBlockVolumeByIdRequest(volID)); sdkErr != nil {
+		if sdkErr.IsError(lsdkErrs.EcVServerVolumeNotFound) {
+			llog.InfoS("[INFO] - DeleteVolume: The volume was deleted before", "volumeId", volID)
+			return nil
+		}
+
+		ierr := lserr.ErrVolumeFailedToDelete(volID, sdkErr)
+		llog.ErrorS(ierr.GetError(), "[ERROR] - DeleteVolume: Failed to delete the volume", ierr.GetListParameters()...)
+
+		return ierr
+	}
+
+	llog.InfoS("[INFO] - DeleteVolume: Deleted the volume successfully", "volumeId", volID)
+
+	return nil
 }
 
-func (s *cloud) AttachVolume(pinstanceId, pvolumeId string) (*lsentity.Volume, lserr.IError) {
-	var (
-		svol *lsentity.Volume
-		ierr lserr.IError
-	)
-
-	_ = ljwait.ExponentialBackoff(ljwait.NewBackOff(5, 10, true, ljtime.Minute(10)), func() (bool, error) {
-		vol, sdkErr := s.client.VServerGateway().V2().VolumeService().
-			GetBlockVolumeById(lsdkVolumeV2.NewGetBlockVolumeByIdRequest(pvolumeId))
-		if sdkErr != nil {
-			if sdkErr.IsError(lsdkErrs.EcVServerVolumeNotFound) || vol == nil {
-				ierr = lserr.ErrVolumeNotFound(pvolumeId)
-				llog.ErrorS(ierr.GetError(), "[ERROR] - AttachVolume: Volume not found", ierr.GetListParameters()...)
-				return false, ierr.GetError()
-			}
-
-			return false, nil
-		}
-
-		// Volume is in error state
-		if vol.IsError() {
-			ierr = lserr.ErrVolumeIsInErrorState(pvolumeId)
-			llog.ErrorS(ierr.GetError(), "[ERROR] - AttachVolume: The volume is in error state", ierr.GetListParameters()...)
-			return false, ierr.GetError()
-		}
-
-		if vol.AttachedTheInstance(pinstanceId) {
-			ierr = nil // reset
-			llog.InfoS("[INFO] - AttachVolume: The volume is already attached", "volumeId", pvolumeId, "instanceId", pinstanceId)
-			return true, nil
-		}
-
-		if vol.MultiAttach || vol.IsAvailable() {
-			sdkErr = s.client.VServerGateway().V2().ComputeService().
-				AttachBlockVolume(lsdkComputeV2.NewAttachBlockVolumeRequest(pinstanceId, pvolumeId))
-			if sdkErr != nil {
-				switch sdkErr.GetErrorCode() {
-				case lsdkErrs.EcVServerVolumeAlreadyAttachedThisServer:
-					ierr = nil // reset
-					llog.InfoS("[INFO] - AttachVolume: The volume is already attached", "volumeId", pvolumeId, "instanceId", pinstanceId)
-					return true, nil
-				case lsdkErrs.EcVServerVolumeInProcess:
-					llog.InfoS("[INFO] - AttachVolume: The volume is in process", "volumeId", pvolumeId, "instanceId", pinstanceId)
-					return false, nil
-				default:
-					ierr = lserr.ErrVolumeFailedToAttach(pinstanceId, pvolumeId, sdkErr)
-					llog.ErrorS(ierr.GetError(), "[ERROR] - AttachVolume: Failed to attach the volume", ierr.GetListParameters()...)
-					return false, ierr.GetError()
-				}
-			}
-
-			ierr = nil // reset
-			llog.InfoS("[INFO] - AttachVolume: Attached the volume successfully", "volumeId", pvolumeId, "instanceId", pinstanceId)
-			return true, nil
-		}
-
-		return false, nil
-	})
-
+// AttachVolume gan volume vao instance va cho toi khi vServer bao da gan xong.
+//
+// Bo cuc: doc trang thai -> phat lenh DUNG MOT LAN -> poll read-only, ctx la
+// deadline. Giong DetachVolume ben duoi va giong aws-ebs-csi-driver AttachDisk.
+func (s *cloud) AttachVolume(pctx lctx.Context, pinstanceId, pvolumeId string) (*lsentity.Volume, lserr.IError) {
+	vol, ierr := s.getVolumeForAttach(pvolumeId)
 	if ierr != nil {
 		return nil, ierr
 	}
 
-	_ = ljwait.ExponentialBackoff(ljwait.NewBackOff(5, 10, true, ljtime.Minute(10)), func() (bool, error) {
-		vol, sdkErr := s.client.VServerGateway().V2().VolumeService().
-			GetBlockVolumeById(lsdkVolumeV2.NewGetBlockVolumeByIdRequest(pvolumeId))
-		if sdkErr != nil {
-			if sdkErr.IsError(lsdkErrs.EcVServerVolumeNotFound) || vol == nil {
-				ierr = lserr.ErrVolumeNotFound(pvolumeId)
-				llog.ErrorS(ierr.GetError(), "[ERROR] - AttachVolume: Volume not found", ierr.GetListParameters()...)
-				return false, ierr.GetError()
-			}
+	if vol.AttachedTheInstance(pinstanceId) {
+		llog.InfoS("[INFO] - AttachVolume: The volume is already attached", "volumeId", pvolumeId, "instanceId", pinstanceId)
+		return lsentity.NewVolume(vol), nil
+	}
 
-			llog.ErrorS(ierr.GetError(), "[ERROR] - AttachVolume: Failed to get the volume when waiting it become archieve status", ierr.GetListParameters()...)
-			return false, nil
+	// Phat lenh attach dung mot lan. Neu ctx het han o buoc poll, CO se goi lai
+	// ca RPC nay va lan do se di vao nhanh "da attach" o tren.
+	llog.InfoS("[INFO] - AttachVolume: Attaching the volume", "volumeId", pvolumeId, "instanceId", pinstanceId)
+	if sdkErr := s.client.VServerGateway().V2().ComputeService().
+		AttachBlockVolume(lsdkComputeV2.NewAttachBlockVolumeRequest(pinstanceId, pvolumeId)); sdkErr != nil {
+		switch sdkErr.GetErrorCode() {
+		case lsdkErrs.EcVServerVolumeAlreadyAttachedThisServer:
+			// Muc tieu da dat.
+		case lsdkErrs.EcVServerVolumeInProcess:
+			llog.InfoS("[INFO] - AttachVolume: The volume is in process, waiting", "volumeId", pvolumeId)
+		default:
+			ierr = lserr.ErrVolumeFailedToAttach(pinstanceId, pvolumeId, sdkErr)
+			llog.ErrorS(ierr.GetError(), "[ERROR] - AttachVolume: Failed to attach the volume", ierr.GetListParameters()...)
+
+			return nil, ierr
+		}
+	}
+
+	return s.waitDiskAttached(pctx, pinstanceId, pvolumeId)
+}
+
+// getVolumeForAttach doc trang thai volume truoc khi attach.
+//
+// Loi doc PHAI duoc phan biet ro: truoc day moi loi tu GetBlockVolumeById deu bi
+// bao cao la ErrVolumeNotFound, vi dieu kien `sdkErr.IsError(NotFound) || vol == nil`
+// luon dung - SDK tra vol == nil tren MOI loi. Mot cu 429 hay 500 vi the hien ra
+// nhu "volume khong ton tai", vua sai chan doan vua khien caller bo cuoc thay vi
+// thu lai.
+func (s *cloud) getVolumeForAttach(pvolumeId string) (*lsdkEntity.Volume, lserr.IError) {
+	vol, sdkErr := s.client.VServerGateway().V2().VolumeService().
+		GetBlockVolumeById(lsdkVolumeV2.NewGetBlockVolumeByIdRequest(pvolumeId))
+	if sdkErr != nil {
+		if sdkErr.IsError(lsdkErrs.EcVServerVolumeNotFound) {
+			ierr := lserr.ErrVolumeNotFound(pvolumeId)
+			llog.ErrorS(ierr.GetError(), "[ERROR] - AttachVolume: Volume not found", ierr.GetListParameters()...)
+
+			return nil, ierr
 		}
 
-		if vol.IsError() {
-			ierr = lserr.ErrVolumeIsInErrorState(pvolumeId)
-			llog.ErrorS(ierr.GetError(), "[ERROR] - AttachVolume: The volume is in error state", ierr.GetListParameters()...)
-			return false, ierr.GetError()
-		}
+		ierr := lserr.ErrVolumeFailedToGet(pvolumeId, sdkErr)
+		llog.ErrorS(ierr.GetError(), "[ERROR] - AttachVolume: Failed to get the volume", ierr.GetListParameters()...)
 
-		if vol.AttachedTheInstance(pinstanceId) {
-			ierr = nil // reset
-			svol = lsentity.NewVolume(vol)
-			return true, nil
-		}
-
-		return false, nil
-	})
-
-	if ierr != nil {
 		return nil, ierr
 	}
 
-	return svol, nil
+	if vol.IsError() {
+		ierr := lserr.ErrVolumeIsInErrorState(pvolumeId)
+		llog.ErrorS(ierr.GetError(), "[ERROR] - AttachVolume: The volume is in error state", ierr.GetListParameters()...)
+
+		return nil, ierr
+	}
+
+	return vol, nil
 }
 
-func (s *cloud) DetachVolume(pinstanceId, pvolumeId string) lserr.IError {
-	llog.InfoS("[INFO] - DetachVolume: Start detaching the volume", "volumeId", pvolumeId, "instanceId", pinstanceId)
-
-	var (
-		ierr lserr.IError
-	)
-
-	_ = ljwait.ExponentialBackoff(ljwait.NewBackOff(5, 10, true, ljtime.Minute(10)), func() (bool, error) {
-		vol, sdkErr := s.client.VServerGateway().V2().VolumeService().
-			GetBlockVolumeById(lsdkVolumeV2.NewGetBlockVolumeByIdRequest(pvolumeId))
-		if sdkErr != nil {
-			ierr = lserr.ErrVolumeFailedToGet(pvolumeId, sdkErr)
-			llog.ErrorS(ierr.GetError(), "[ERROR] - DetachVolume: Failed to get the volume", ierr.GetListParameters()...)
-			return false, ierr.GetError()
+// DetachVolume go volume khoi instance va cho toi khi vServer bao da roi han.
+//
+// Hop dong: idempotent (CSI spec 5.4). Goi lai tren mot volume da detach phai
+// tra nil, khong duoc tra error - neu khong external-attacher se khong bao gio
+// go duoc finalizer cua VolumeAttachment.
+func (s *cloud) DetachVolume(pctx lctx.Context, pinstanceId, pvolumeId string) lserr.IError {
+	vol, sdkErr := s.client.VServerGateway().V2().VolumeService().
+		GetBlockVolumeById(lsdkVolumeV2.NewGetBlockVolumeByIdRequest(pvolumeId))
+	if sdkErr != nil {
+		if sdkErr.IsError(lsdkErrs.EcVServerVolumeNotFound) {
+			llog.InfoS("[INFO] - DetachVolume: The volume no longer exists, treat as detached", "volumeId", pvolumeId)
+			return nil
 		}
 
-		// Ignore if the volume is AVAILABLE status => This volume is not attached to any instance
-		if vol.IsAvailable() {
-			ierr = nil // reset the ierr variable
-			llog.InfoS("[INFO] - DetachVolume: The volume is already detached", "volumeId", pvolumeId)
-			return true, nil
-		}
+		ierr := lserr.ErrVolumeFailedToGet(pvolumeId, sdkErr)
+		llog.ErrorS(ierr.GetError(), "[ERROR] - DetachVolume: Failed to get the volume", ierr.GetListParameters()...)
 
-		// Ignore if the volume is not attached to this instance
-		if !vol.AttachedTheInstance(pinstanceId) {
-			ierr = nil
-			llog.InfoS("[INFO] - DetachVolume: The volume is not attached to the instance", "volumeId", pvolumeId, "instanceId", pinstanceId)
-			return true, nil
-		}
+		return ierr
+	}
 
-		// Return if the volume is in ERROR state => stop the process if the volume is in ERROR state
-		if vol.IsError() {
-			ierr = lserr.ErrVolumeIsInErrorState(pvolumeId)
-			llog.InfoS("[INFO] - DetachVolume: The volume is in error state", "volumeId", pvolumeId)
-			return false, ierr.GetError()
-		}
+	if isDetachedFrom(vol, pinstanceId) {
+		llog.InfoS("[INFO] - DetachVolume: The volume is already detached from the instance",
+			"volumeId", pvolumeId, "instanceId", pinstanceId, "status", vol.Status)
 
-		// Only detach the volume if it is in IN-USE state
-		if vol.IsInUse() {
-			llog.InfoS("[INFO] - DetachVolume: Detaching the volume", "volumeId", pvolumeId, "instanceId", pinstanceId)
-			if sdkErr = s.client.VServerGateway().V2().ComputeService().
-				DetachBlockVolume(lsdkComputeV2.NewDetachBlockVolumeRequest(pinstanceId, pvolumeId)); sdkErr != nil {
-				ierr = lserr.ErrVolumeFailedToDetach(pinstanceId, pvolumeId, sdkErr)
-				llog.ErrorS(ierr.GetError(), "[ERROR] - DetachVolume: Failed to detach the volume", ierr.GetListParameters()...)
-			}
-		}
-
-		// Return false to wait for the next iteration
-		return false, nil
-	})
-
-	if ierr == nil {
-		llog.InfoS("[DEBUG] - DetachVolume: Detached the volume successfully", "volumeId", pvolumeId, "instanceId", pinstanceId)
 		return nil
 	}
 
-	return ierr
+	if vol.IsError() {
+		llog.InfoS("[INFO] - DetachVolume: The volume is in error state", "volumeId", pvolumeId)
+		return lserr.ErrVolumeIsInErrorState(pvolumeId)
+	}
+
+	// Phat lenh detach dung mot lan. Truoc day lenh nay nam trong than vong lap
+	// nen bi phat lai moi 10 giay trong toi da 10 phut.
+	llog.InfoS("[INFO] - DetachVolume: Detaching the volume", "volumeId", pvolumeId, "instanceId", pinstanceId)
+	if sdkErr = s.client.VServerGateway().V2().ComputeService().
+		DetachBlockVolume(lsdkComputeV2.NewDetachBlockVolumeRequest(pinstanceId, pvolumeId)); sdkErr != nil {
+		switch {
+		case errSetDetachDone.ContainsOne(sdkErr.GetErrorCode()):
+			llog.InfoS("[INFO] - DetachVolume: Nothing left to detach", "volumeId", pvolumeId,
+				"instanceId", pinstanceId, "errorCode", sdkErr.GetStringErrorCode())
+
+			return nil
+		case errSetDetachRetryable.ContainsOne(sdkErr.GetErrorCode()):
+			llog.InfoS("[INFO] - DetachVolume: The volume is busy, waiting", "volumeId", pvolumeId,
+				"errorCode", sdkErr.GetStringErrorCode())
+		default:
+			ierr := lserr.ErrVolumeFailedToDetach(pinstanceId, pvolumeId, sdkErr)
+			llog.ErrorS(ierr.GetError(), "[ERROR] - DetachVolume: Failed to detach the volume", ierr.GetListParameters()...)
+
+			return ierr
+		}
+	}
+
+	return s.waitVolumeDetached(pctx, pinstanceId, pvolumeId)
 }
 
-func (s *cloud) ResizeOrModifyDisk(volumeID string, newSizeBytes int64, options *ModifyDiskOptions) (newSize int64, err error) {
+func (s *cloud) ResizeOrModifyDisk(pctx lctx.Context, volumeID string, newSizeBytes int64, options *ModifyDiskOptions) (newSize int64, err error) {
 	newSizeGiB := uint64(lsutil.RoundUpGiB(newSizeBytes))
 	volume, sdkErr := s.GetVolume(volumeID)
 	if sdkErr != nil {
@@ -365,7 +324,7 @@ func (s *cloud) ResizeOrModifyDisk(volumeID string, newSizeBytes int64, options 
 	}
 
 	// Check that we need to modify this volume`
-	needsModification, volumeSize, err := s.validateModifyVolume(volumeID, newSizeGiB, options)
+	needsModification, volumeSize, err := s.validateModifyVolume(pctx, volumeID, newSizeGiB, options)
 	if err != nil || !needsModification {
 		return volumeSize, err
 	}
@@ -375,44 +334,9 @@ func (s *cloud) ResizeOrModifyDisk(volumeID string, newSizeBytes int64, options 
 	if sdkErr2 != nil {
 		return 0, sdkErr2.GetError()
 	} else if !same && !volume.IsAttched() {
-		// In the case of these volume types are not in the same zone, we MUST migrate the volume to the target zone before resize this volume
-		err = ljwait.ExponentialBackoff(ljwait.NewBackOff(10, 10, true, ljtime.Minute(30)), func() (bool, error) {
-			volume, sdkErr = s.GetVolume(volumeID)
-			if sdkErr != nil {
-				return true, sdkErr.GetError()
-			}
-
-			if volume.IsMigration() || volume.IsCreating() {
-				return false, nil
-			} else if volumeArchivedStatus.ContainsOne(volume.Status) && volume.VolumeTypeID == options.VolumeType {
-				// Check the volume status is in the archived status
-				return true, nil
-			}
-
-			// So make a migration volume request to the VngCloud API
-			sdkErr2 = s.client.VServerGateway().V2().VolumeService().
-				MigrateBlockVolumeById(
-					lsdkVolumeV2.NewMigrateBlockVolumeByIdRequest(volumeID, options.VolumeType).
-						WithConfirm(true))
-
-			// In the case of getting an error from the VngCloud API
-			if sdkErr2 != nil {
-				switch sdkErr2.GetErrorCode() {
-				case lsdkErrs.EcVServerVolumeMigrateInSameZone, lsdkErrs.EcVServerVolumeMigrateBeingProcess, lsdkErrs.EcVServerVolumeMigrateProcessingConfirm, lsdkErrs.EcVServerVolumeMigrateBeingMigrating, lsdkErrs.EcVServerVolumeMigrateBeingFinish:
-					// These statuses are used to indicate that the volume is being migrated => continue to wait
-					return false, nil
-				default:
-					// In some other cases, we need to handle the error
-					return true, sdkErr2.GetError()
-				}
-			}
-
-			// Otherwise, we need to wait for the volume to be migrated
-			return false, nil
-		})
-
-		if err != nil {
-			return 0, err
+		// Volume type dich nam o zone khac => phai migrate truoc khi resize.
+		if ierr := s.migrateVolumeToType(pctx, volumeID, options.VolumeType); ierr != nil {
+			return 0, ierr.GetError()
 		}
 	}
 
@@ -422,7 +346,7 @@ func (s *cloud) ResizeOrModifyDisk(volumeID string, newSizeBytes int64, options 
 		return 0, sdkErr.GetError()
 	}
 
-	_, err = s.waitVolumeAchieveStatus(volumeID, volumeArchivedStatus)
+	_, err = s.waitVolumeAchieveStatus(pctx, volumeID, volumeArchivedStatus)
 	if err != nil {
 		return 0, err
 	}
@@ -431,45 +355,70 @@ func (s *cloud) ResizeOrModifyDisk(volumeID string, newSizeBytes int64, options 
 	return s.checkDesiredState(volumeID, newSizeGiB, options)
 }
 
-func (s *cloud) ModifyVolumeType(pvolumeId, pvolumeType string, psize int) lserr.IError {
+// migrateVolumeToType chuyen volume sang volume type o zone khac roi cho xong.
+//
+// Bo cuc giong DetachVolume: doc trang thai -> phat lenh DUNG MOT LAN (va chi
+// khi chua co migration nao chay) -> poll read-only voi ctx la deadline.
+//
+// Truoc day lenh migrate nam trong than vong lap, va vong do dung
+// NewBackOff(10, 10, true, 30m): voi Revert=true thi lan sleep DAU TIEN la
+// floor((2^9-1)/2) = 255 giay, trong khi csi-resizer chi cho 60 giay.
+func (s *cloud) migrateVolumeToType(pctx lctx.Context, pvolumeId, ptargetType string) lserr.IError {
+	raw, sdkErr := s.getVolumeById(pvolumeId)
+	if sdkErr != nil {
+		return lserr.ErrVolumeFailedToGet(pvolumeId, sdkErr)
+	}
+
+	vol := lsentity.NewVolume(raw)
+	if isMigratedToType(vol, ptargetType) {
+		llog.InfoS("[INFO] - migrateVolumeToType: The volume is already on the target type",
+			"volumeId", pvolumeId, "volumeType", ptargetType)
+
+		return nil
+	}
+
+	if !vol.IsMigration() && !vol.IsCreating() {
+		llog.InfoS("[INFO] - migrateVolumeToType: Migrating the volume",
+			"volumeId", pvolumeId, "volumeType", ptargetType)
+
+		if migErr := s.client.VServerGateway().V2().VolumeService().
+			MigrateBlockVolumeById(lsdkVolumeV2.NewMigrateBlockVolumeByIdRequest(pvolumeId, ptargetType).
+				WithConfirm(true)); migErr != nil {
+			if !errSetMigrateInProgress.ContainsOne(migErr.GetErrorCode()) {
+				llog.ErrorS(migErr.GetError(), "[ERROR] - migrateVolumeToType: Failed to migrate the volume", migErr.GetListParameters()...)
+				return lserr.NewError(migErr)
+			}
+
+			llog.InfoS("[INFO] - migrateVolumeToType: Migration is already in progress",
+				"volumeId", pvolumeId, "errorCode", migErr.GetStringErrorCode())
+		}
+	}
+
+	return s.waitVolumeMigrated(pctx, pvolumeId, ptargetType)
+}
+
+func (s *cloud) ModifyVolumeType(pctx lctx.Context, pvolumeId, pvolumeType string, psize int) lserr.IError {
 	llog.InfoS("[INFO] - ModifyVolumeType: Modify the volume type", "volumeId", pvolumeId, "volumeType", pvolumeType, "size", psize)
 	opts := lsdkVolumeV2.NewResizeBlockVolumeByIdRequest(pvolumeId, pvolumeType, psize)
-	_, sdkErr := s.client.VServerGateway().V2().VolumeService().ResizeBlockVolumeById(opts)
 
-	if sdkErr != nil {
+	if _, sdkErr := s.client.VServerGateway().V2().VolumeService().ResizeBlockVolumeById(opts); sdkErr != nil {
 		if !sdkErr.IsError(lsdkErrs.EcVServerVolumeUnchanged) {
 			llog.ErrorS(sdkErr.GetError(), "[ERROR] - ModifyVolumeType: Failed to modify the volume type", sdkErr.GetListParameters()...)
 			return lserr.NewError(sdkErr)
 		}
 	}
 
-	var ierr lserr.IError
-	llog.InfoS("[INFO] - ModifyVolumeType: Modified the volume type successfully, waiting the volume to be desired state", "volumeId", pvolumeId, "volumeType", pvolumeType, "size", psize)
-	_ = ljwait.ExponentialBackoff(ljwait.NewBackOff(5, 10, true, ljtime.Minute(20)), func() (bool, error) {
-		vol, sdkErr2 := s.GetVolume(pvolumeId)
-		if sdkErr2 != nil {
-			llog.ErrorS(sdkErr2.GetError(), "[ERROR] - ModifyVolumeType: Failed to get the volume", sdkErr2.GetListParameters()...)
-			return false, sdkErr2.GetError()
-		}
+	llog.InfoS("[INFO] - ModifyVolumeType: Request accepted, waiting for the volume to settle",
+		"volumeId", pvolumeId, "volumeType", pvolumeType, "size", psize)
 
-		if volumeArchivedStatus.ContainsOne(vol.Status) && vol.VolumeTypeID == pvolumeType {
-			return true, nil
-		}
-
-		// if the volume is in ERROR state => return right now
-		if vol.IsError() {
-			ierr = lserr.ErrVolumeIsInErrorState(pvolumeId)
-			return false, ierr.GetError()
-		}
-
-		return false, nil
-	})
-
-	return ierr
+	// Truoc day vong cho nay la `_ = ljwait.ExponentialBackoff(...)` roi ket luan
+	// bang bien sentinel `ierr`: het 20 phut ma volume chua ve dung type thi ierr
+	// van nil va ham bao THANH CONG. Gio het gio la tra loi.
+	return s.waitVolumeMigrated(pctx, pvolumeId, pvolumeType)
 }
 
-func (s *cloud) ExpandVolume(volumeID, volumeTypeID string, newSize uint64) error {
-	_, err := s.ResizeOrModifyDisk(volumeID, lsutil.GiBToBytes(int64(newSize)), &ModifyDiskOptions{
+func (s *cloud) ExpandVolume(pctx lctx.Context, volumeID, volumeTypeID string, newSize uint64) error {
+	_, err := s.ResizeOrModifyDisk(pctx, volumeID, lsutil.GiBToBytes(int64(newSize)), &ModifyDiskOptions{
 		VolumeType: volumeTypeID,
 	})
 	return err
