@@ -68,11 +68,13 @@ func (s *cloud) waitSnapshotActive(pvolID, psnapshotName string) error {
 	})
 }
 
-// isDetachedFrom cho biet co the coi volume da roi khoi instance hay chua.
+// isDetachedFrom reports whether the volume can be considered detached from
+// the instance.
 //
-// Day la dieu kien dung cua ControllerUnpublishVolume theo CSI spec: RPC phai
-// idempotent, nen moi trang thai "khong con dinh vao dung instance nay" deu la
-// thanh cong - ke ca khi volume dang dinh vao MOT instance khac.
+// This is the correct completion condition for ControllerUnpublishVolume under
+// the CSI spec: the RPC must be idempotent, so every state that is "no longer
+// attached to this particular instance" counts as success - including the
+// volume being attached to a DIFFERENT instance.
 func isDetachedFrom(pvol *lsdkEntity.Volume, pinstanceId string) bool {
 	if pvol == nil {
 		return false
@@ -81,8 +83,8 @@ func isDetachedFrom(pvol *lsdkEntity.Volume, pinstanceId string) bool {
 	return pvol.IsAvailable() || !pvol.AttachedTheInstance(pinstanceId)
 }
 
-// waitDiskAttached poll cho toi khi volume dinh vao dung instance.
-// Chi DOC - lenh attach da duoc phat mot lan trong AttachVolume.
+// waitDiskAttached polls until the volume is attached to the right instance.
+// Read-only - the attach command was already issued once in AttachVolume.
 func (s *cloud) waitDiskAttached(pctx lctx.Context, pinstanceId, pvolumeId string) (*lsentity.Volume, lserr.IError) {
 	var res *lsentity.Volume
 
@@ -90,10 +92,11 @@ func (s *cloud) waitDiskAttached(pctx lctx.Context, pinstanceId, pvolumeId strin
 	waitErr := lwait.ExponentialBackoffWithContext(pctx, volumeOperationBackoff, func(_ lctx.Context) (bool, error) {
 		vol, err := s.getVolumeById(pvolumeId)
 		if err != nil {
-			// Loi doc trang thai KHONG lam hong lenh attach da phat di. Bo cuoc o
-			// day se lam RPC that bai chi vi mot cu 500 hay mot nhip DNS.
-			// aws-ebs-csi-driver xu ly y het trong WaitForAttachmentState:
-			// "Ignoring error from describe volume, will retry". ctx van cat vong nay.
+			// A read error does NOT invalidate the attach command already sent.
+			// Giving up here would fail the RPC over a single 500 or a DNS blip.
+			// aws-ebs-csi-driver does exactly this in WaitForAttachmentState:
+			// "Ignoring error from describe volume, will retry". The ctx still
+			// bounds this loop.
 			llog.InfoS("[WARN] - waitDiskAttached: Ignoring error while polling, will retry",
 				"volumeId", pvolumeId, "err", err.GetMessage())
 
@@ -126,8 +129,9 @@ func (s *cloud) waitDiskAttached(pctx lctx.Context, pinstanceId, pvolumeId strin
 	return res, nil
 }
 
-// waitVolumeDetached poll cho toi khi volume khong con dinh vao instance.
-// Chi DOC - lenh detach da duoc phat mot lan trong DetachVolume.
+// waitVolumeDetached polls until the volume is no longer attached to the
+// instance. Read-only - the detach command was already issued once in
+// DetachVolume.
 func (s *cloud) waitVolumeDetached(pctx lctx.Context, pinstanceId, pvolumeId string) lserr.IError {
 	start := ltime.Now()
 	waitErr := lwait.ExponentialBackoffWithContext(pctx, volumeOperationBackoff, func(_ lctx.Context) (bool, error) {
@@ -169,8 +173,8 @@ func (s *cloud) waitVolumeDetached(pctx lctx.Context, pinstanceId, pvolumeId str
 	return nil
 }
 
-// waitVolumeDeletable cho volume ve trang thai co the xoa.
-// Volume bien mat giua chung thi coi nhu da xoa (idempotent).
+// waitVolumeDeletable waits for the volume to reach a deletable state.
+// A volume that disappears mid-wait counts as deleted (idempotency).
 func (s *cloud) waitVolumeDeletable(pctx lctx.Context, pvolumeId string) lserr.IError {
 	start := ltime.Now()
 	waitErr := lwait.ExponentialBackoffWithContext(pctx, volumeOperationBackoff, func(_ lctx.Context) (bool, error) {
@@ -206,8 +210,9 @@ func (s *cloud) waitVolumeDeletable(pctx lctx.Context, pvolumeId string) lserr.I
 	return nil
 }
 
-// isMigratedToType cho biet volume da nam yen o volume type dich hay chua.
-// Phai dung CA HAI dieu kien: trang thai on dinh VA dung type.
+// isMigratedToType reports whether the volume has settled on the target
+// volume type. BOTH conditions are required: a settled status AND the right
+// type.
 func isMigratedToType(pvol *lsentity.Volume, ptargetType string) bool {
 	if pvol == nil {
 		return false
@@ -216,8 +221,9 @@ func isMigratedToType(pvol *lsentity.Volume, ptargetType string) bool {
 	return volumeArchivedStatus.ContainsOne(pvol.Status) && pvol.VolumeTypeID == ptargetType
 }
 
-// waitVolumeMigrated poll cho toi khi volume ve dung volume type dich.
-// Chi DOC - lenh migrate da duoc phat mot lan trong migrateVolumeToType.
+// waitVolumeMigrated polls until the volume reaches the target volume type.
+// Read-only - the migrate command was already issued once in
+// migrateVolumeToType.
 func (s *cloud) waitVolumeMigrated(pctx lctx.Context, pvolumeId, ptargetType string) lserr.IError {
 	start := ltime.Now()
 	waitErr := lwait.ExponentialBackoffWithContext(pctx, volumeMigrationBackoff, func(_ lctx.Context) (bool, error) {
