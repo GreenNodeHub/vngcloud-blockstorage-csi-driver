@@ -227,7 +227,7 @@ func (s *controllerService) CreateVolume(pctx lctx.Context, preq *lcsi.CreateVol
 
 	newVol, sdkErr := s.cloud.EitherCreateResizeVolume(cvr.ToSdkCreateVolumeRequest())
 	if sdkErr != nil {
-		llog.ErrorS(sdkErr.GetError(), "[ERROR] - CreateVolume: failed to create volume", sdkErr.GetErrorMessages())
+		llog.ErrorS(sdkErr.GetError(), "[ERROR] - CreateVolume: failed to create volume", "errMsg", sdkErr.GetErrorMessages())
 		s.k8sClient.PersistentVolumeClaimEventWarning(pctx, cvr.PvcNamespaceTag, cvr.PvcNameTag,
 			"CsiCreateVolumeFailure", sdkErr.GetMessage())
 		return nil, sdkErr.GetError()

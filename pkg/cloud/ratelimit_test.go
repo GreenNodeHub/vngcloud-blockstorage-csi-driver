@@ -54,8 +54,12 @@ func TestAdaptiveRateLimiterDecreasesOnThrottle(t *ltesting.T) {
 		t.Fatalf("initial QPS = %v, want %v", got, rateLimitMaxQPS)
 	}
 
+	// Each iteration is a SEPARATE throttle event, spaced past the cooldown.
+	// A burst of 429s arriving together is one event, and is covered by
+	// TestAdaptiveRateLimiterCollapsesAConcurrentThrottleBurst.
 	want := rateLimitMaxQPS
 	for i := 0; i < 10; i++ {
+		now = now.Add(rateLimitDecreaseCooldown)
 		rl.onThrottled(now)
 		want *= rateLimitDecreaseFactor
 		if want < rateLimitMinQPS {
@@ -240,5 +244,61 @@ func TestThrottledHTTPClientRecoversAfterNonThrottleErrors(t *ltesting.T) {
 
 	if got := client.limiter.currentQPS(); got <= dropped {
 		t.Fatalf("a 500 is not throttling, recovery must proceed: before %v, after %v", dropped, got)
+	}
+}
+
+// TestAdaptiveRateLimiterCollapsesAConcurrentThrottleBurst pins the behaviour
+// that the TS-B load test found missing on 29/08/2026: with worker-threads=100
+// a single throttle event arrives as a BURST of 429s, one per in-flight
+// request. Halving once per 429 collapsed the limiter 20 -> 1 QPS in ~100ms,
+// after which recovery took (20-1)/1 * 5s = 95s. One throttle event must cost
+// exactly one halving.
+func TestAdaptiveRateLimiterCollapsesAConcurrentThrottleBurst(t *ltesting.T) {
+	rl := newAdaptiveRateLimiter()
+	now := ltime.Unix(0, 0)
+
+	// Eight concurrent requests all bounce off the same throttle event.
+	for i := 0; i < 8; i++ {
+		rl.onThrottled(now.Add(ltime.Duration(i) * ltime.Millisecond))
+	}
+
+	want := rateLimitMaxQPS * rateLimitDecreaseFactor
+	if got := rl.currentQPS(); got != want {
+		t.Fatalf("a burst of 8 concurrent 429s dropped QPS to %v, want a single halving to %v", got, want)
+	}
+}
+
+// TestAdaptiveRateLimiterKeepsBackingOffOnSustainedThrottling: the cooldown
+// must not blunt the response to throttling that genuinely persists.
+func TestAdaptiveRateLimiterKeepsBackingOffOnSustainedThrottling(t *ltesting.T) {
+	rl := newAdaptiveRateLimiter()
+	at := ltime.Unix(0, 0)
+
+	rl.onThrottled(at)
+	first := rl.currentQPS()
+
+	at = at.Add(rateLimitDecreaseCooldown)
+	rl.onThrottled(at)
+
+	want := first * rateLimitDecreaseFactor
+	if got := rl.currentQPS(); got != want {
+		t.Fatalf("a throttle past the cooldown left QPS at %v, want a further halving to %v", got, want)
+	}
+}
+
+// A throttle spell that genuinely persists must still walk the rate down to the
+// floor - the cooldown spaces the decreases out, it must not cap them.
+func TestAdaptiveRateLimiterStillReachesFloorUnderSustainedThrottling(t *ltesting.T) {
+	rl := newAdaptiveRateLimiter()
+	at := ltime.Unix(0, 0)
+
+	// 60s of unbroken throttling, requests arriving every 100ms.
+	for i := 0; i < 600; i++ {
+		at = at.Add(100 * ltime.Millisecond)
+		rl.onThrottled(at)
+	}
+
+	if got := rl.currentQPS(); got != rateLimitMinQPS {
+		t.Fatalf("after a sustained throttle spell QPS = %v, want the floor %v", got, rateLimitMinQPS)
 	}
 }

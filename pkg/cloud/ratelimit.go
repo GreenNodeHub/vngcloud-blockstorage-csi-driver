@@ -49,6 +49,12 @@ const (
 	// Multiplicative decrease on a 429.
 	rateLimitDecreaseFactor = 0.5
 
+	// Minimum spacing between two decreases. With worker-threads=100 a single
+	// throttle event comes back as a burst of 429s, one per in-flight request;
+	// halving on each of them collapses the rate to the floor in milliseconds
+	// and then costs 95s of recovery. One throttle event, one halving.
+	rateLimitDecreaseCooldown = 1 * ltime.Second
+
 	// Additive increase every rateLimitRecoverEvery while no longer throttled.
 	rateLimitIncreaseQPS  = 1.0
 	rateLimitRecoverEvery = 5 * ltime.Second
@@ -81,6 +87,12 @@ func newAdaptiveRateLimiter() *adaptiveRateLimiter {
 func (s *adaptiveRateLimiter) onThrottled(pnow ltime.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// Every in-flight request bounces off the same throttle event, so without
+	// this the rate is halved once PER REQUEST rather than once per event.
+	if !s.lastAdj.IsZero() && pnow.Sub(s.lastAdj) < rateLimitDecreaseCooldown {
+		return
+	}
 
 	next := s.qps * rateLimitDecreaseFactor
 	if next < rateLimitMinQPS {
