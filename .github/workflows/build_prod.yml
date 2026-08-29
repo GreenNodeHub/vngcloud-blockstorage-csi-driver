@@ -1,84 +1,293 @@
 name: Release PROD - Build & Push Image
 
+# A release must exist in BOTH regions (HCM and HAN). Each region has its own
+# registry URL, username and password.
+#
+# Shape: validate -> build ONCE -> push in parallel via the matrix -> gate.
+#
+# Why build once and push twice, instead of rebuilding per region: two runs of
+# `make build-local-images` produce two different images (timestamps, layer
+# ordering), so the two regions would run different binaries under the same
+# tag. Building once and `docker save`-ing to an artifact guarantees both
+# regions receive byte-identical content.
+#
+# Adding a region = adding one entry to the `region` matrix below, not copying
+# three more steps.
+
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Tag version to build'
+        description: 'Tag version to build (must start with vN.N.N)'
         required: true
-      registry:
-        description: 'Select which registry to build & push to'
+      regions:
+        description: 'Regions to push to'
         required: true
         default: 'ALL'
         type: choice
         options:
           - ALL
-          - VCR_REGISTRY
-          - VCR_HAN_REGISTRY
+          - HCM
+          - HAN
+
+env:
+  IMAGE_NAME: vngcloud-blockstorage-csi-driver
+  # Local tag used during the build, before retagging per registry.
+  LOCAL_REF: localhost/release/vngcloud-blockstorage-csi-driver
 
 jobs:
-  build-and-push:
+  validate:
+    name: Validate version
     runs-on: ubuntu-latest
-    environment: production
-
+    timeout-minutes: 5
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-      - name: Set common environment
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # The image tag is also the VERSION injected into ldflags:
+      #   Makefile:40  -X k8s.io/component-base/version.gitVersion=$(VERSION)
+      # component-base parses that string with ^v(\d+\.\d+\.\d+) INSIDE the
+      # init() of legacyregistry and panics on a mismatch - before main(),
+      # where nothing can recover. A release typed without the "v" would ship
+      # a crash-looping image to both regions.
+      - name: Version must start with vN.N.N
         run: |
-          echo "REGISTRY_INPUT=${{ github.event.inputs.registry }}" >> $GITHUB_ENV
-          echo "VERSION=${{ github.event.inputs.version }}" >> $GITHUB_ENV
-      - name: Show build config
+          VERSION='${{ inputs.version }}'
+          echo "Version: ${VERSION}"
+          if ! printf '%s' "${VERSION}" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo "::error::Version '${VERSION}' does not match ^v[0-9]+\.[0-9]+\.[0-9]+ - the binary would panic inside init() of k8s.io/component-base/metrics/legacyregistry."
+            exit 1
+          fi
+
+      - name: Git tag must exist
         run: |
-          echo "Building version: ${{ inputs.version }}"
-          echo "Target registry: ${{ inputs.registry }}"
-      ###########################
-      # VCR_REGISTRY
-      ###########################
-      - name: Build image for VCR_REGISTRY
-        if: env.REGISTRY_INPUT == 'VCR_REGISTRY' || env.REGISTRY_INPUT == 'ALL'
+          VERSION='${{ inputs.version }}'
+          if ! git rev-parse -q --verify "refs/tags/${VERSION}" >/dev/null; then
+            echo "::error::Git tag '${VERSION}' not found. Create the tag before releasing."
+            exit 1
+          fi
+          echo "Tag ${VERSION} -> $(git rev-parse --short "refs/tags/${VERSION}")"
+
+  plan:
+    # Filter regions IN THE MATRIX ITSELF instead of a job-level `if:`.
+    # `matrix` is not among the contexts GitHub allows in jobs.<id>.if (only
+    # github / needs / vars / inputs), so a condition like
+    # `inputs.regions == matrix.region.name` makes the whole file unparseable -
+    # GitHub creates a failed run with no jobs, named after the file path.
+    name: Plan regions
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - id: plan
         env:
-          REGISTRY: ${{ vars.VCR_REGISTRY }}
-          VERSION: ${{ env.VERSION }}
+          REGIONS: ${{ inputs.regions }}
+        run: |
+          ALL='[
+            {"name":"HCM","registry_var":"VCR_REGISTRY","username_secret":"VCR_USERNAME","password_secret":"VCR_PASSWORD"},
+            {"name":"HAN","registry_var":"VCR_HAN_REGISTRY","username_secret":"VCR_HAN_USERNAME","password_secret":"VCR_HAN_PASSWORD"}
+          ]'
+          if [ "${REGIONS}" = "ALL" ]; then
+            M=$(printf '%s' "${ALL}" | jq -c '.')
+          else
+            M=$(printf '%s' "${ALL}" | jq -c --arg r "${REGIONS}" 'map(select(.name == $r))')
+          fi
+
+          if [ "$(printf '%s' "${M}" | jq 'length')" -eq 0 ]; then
+            echo "::error::No region matches '${REGIONS}'."
+            exit 1
+          fi
+
+          echo "matrix=${M}" >> "$GITHUB_OUTPUT"
+          printf '%s' "${M}" | jq -r '.[].name' | sed 's/^/  will push to: /'
+
+  build:
+    name: Build image once
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ inputs.version }}
+          fetch-depth: 0
+
+      # REGISTRY must be passed in. The Makefile defaults to
+      # REGISTRY ?= vcr.vngcloud.vn/60108-cuongdm3 (a personal namespace);
+      # leaving it unset would name the image after that.
+      - name: Build
+        env:
+          REGISTRY: localhost/release
+          VERSION: ${{ inputs.version }}
         run: make build-local-images
 
-      - name: Login to VCR_REGISTRY
-        if: env.REGISTRY_INPUT == 'VCR_REGISTRY' || env.REGISTRY_INPUT == 'ALL'
+      - name: Save image
+        run: |
+          docker image save "${LOCAL_REF}:${{ inputs.version }}" -o image.tar
+          ls -lh image.tar
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-image
+          path: image.tar
+          retention-days: 1
+
+  push:
+    name: Push to ${{ matrix.region.name }}
+    needs: [build, plan]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: production
+    strategy:
+      # One broken region must not cancel the other: if HAN fails, HCM still
+      # has to finish, so it is clear exactly which one is missing and needs a
+      # re-push.
+      fail-fast: false
+      matrix:
+        region: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      # Notifications are auxiliary and must never break the release. If the
+      # secrets are missing, skip instead of failing - and `release-ok` declares
+      # no environment, so it only sees repo/org-level secrets, unlike the push
+      # job.
+      - name: Check notification config
+        id: tg
+        run: |
+          if [ -n '${{ secrets.TELEGRAM_TOKEN }}' ] && [ -n '${{ secrets.TELEGRAM_TO }}' ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::TELEGRAM_TO / TELEGRAM_TOKEN not visible in this scope, skipping notifications."
+          fi
+
+      - name: Verify region config
+        run: |
+          echo "Region:   ${{ matrix.region.name }}"
+          echo "Registry: ${{ vars[matrix.region.registry_var] }}"
+          if [ -z '${{ vars[matrix.region.registry_var] }}' ]; then
+            echo "::error::Variable ${{ matrix.region.registry_var }} is empty in environment 'production'. Set it in Settings -> Environments."
+            exit 1
+          fi
+          if [ -z '${{ secrets[matrix.region.username_secret] }}' ] || [ -z '${{ secrets[matrix.region.password_secret] }}' ]; then
+            echo "::error::Missing secret ${{ matrix.region.username_secret }} / ${{ matrix.region.password_secret }} in environment 'production'."
+            exit 1
+          fi
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-image
+
+      - name: Load image
+        run: docker image load -i image.tar
+
+      - name: Login to ${{ matrix.region.name }}
         uses: docker/login-action@v3
         with:
-          registry: ${{ vars.VCR_REGISTRY }}
-          username: ${{ secrets.VCR_USERNAME }}
-          password: ${{ secrets.VCR_PASSWORD }}
+          registry: ${{ vars[matrix.region.registry_var] }}
+          username: ${{ secrets[matrix.region.username_secret] }}
+          password: ${{ secrets[matrix.region.password_secret] }}
 
-      - name: Push image to VCR_REGISTRY
-        if: env.REGISTRY_INPUT == 'VCR_REGISTRY' || env.REGISTRY_INPUT == 'ALL'
+      # TARGET is composed in the shell, not in the `env:` block: IMAGE_NAME
+      # and LOCAL_REF are workflow-level env so they are guaranteed to exist as
+      # shell variables, whereas referencing the `env` context inside an `env:`
+      # block itself tends to yield an empty string with no error - and then
+      # `registry//:version` gets pushed.
+      - name: Tag and push
         env:
-          REGISTRY: ${{ vars.VCR_REGISTRY }}
-          VERSION: ${{ env.VERSION }}
-        run: make push-local-images
+          REGISTRY: ${{ vars[matrix.region.registry_var] }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          TARGET="${REGISTRY}/${IMAGE_NAME}:${VERSION}"
+          echo "Target: ${TARGET}"
 
-      ###########################
-      # VCR_HAN_REGISTRY
-      ###########################
+          docker image tag "${LOCAL_REF}:${VERSION}" "${TARGET}"
+          docker image push "${TARGET}"
 
-      - name: Build image for VCR_HAN_REGISTRY
-        if: env.REGISTRY_INPUT == 'VCR_HAN_REGISTRY' || env.REGISTRY_INPUT == 'ALL'
-        env:
-          REGISTRY: ${{ vars.VCR_HAN_REGISTRY }}
-          VERSION: ${{ env.VERSION }}
-        run: make build-local-images
+          # RepoDigests only exists after a successful push. If it is empty for
+          # any reason, just skip the summary write - do not fail a push step
+          # that already completed.
+          DIGEST=$(docker image inspect "${TARGET}" --format '{{ if .RepoDigests }}{{ index .RepoDigests 0 }}{{ end }}' || true)
+          echo "Pushed: ${TARGET} ${DIGEST:+(${DIGEST})}"
+          {
+            echo "### ${{ matrix.region.name }}"
+            echo ""
+            echo '```'
+            echo "${TARGET}"
+            [ -n "${DIGEST}" ] && echo "${DIGEST}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Login to VCR_HAN_REGISTRY
-        if: env.REGISTRY_INPUT == 'VCR_HAN_REGISTRY' || env.REGISTRY_INPUT == 'ALL'
-        uses: docker/login-action@v3
+      - name: Notify failure
+        if: failure() && steps.tg.outputs.enabled == 'true'
+        uses: appleboy/telegram-action@master
         with:
-          registry: ${{ vars.VCR_HAN_REGISTRY }}
-          username: ${{ secrets.VCR_HAN_USERNAME }}
-          password: ${{ secrets.VCR_HAN_PASSWORD }}
+          to: ${{ secrets.TELEGRAM_TO }}
+          token: ${{ secrets.TELEGRAM_TOKEN }}
+          format: markdown
+          message: |
+            *[PROD] RELEASE FAILED*
+            *Repository*: `${{ github.repository }}`
+            *Region*: `${{ matrix.region.name }}`
+            *Version*: `${{ inputs.version }}`
+            *Author*: `${{ github.actor }}`
+            *Workflow*: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
-      - name: Push image to VCR_HAN_REGISTRY
-        if: env.REGISTRY_INPUT == 'VCR_HAN_REGISTRY' || env.REGISTRY_INPUT == 'ALL'
-        env:
-          REGISTRY: ${{ vars.VCR_HAN_REGISTRY }}
-          VERSION: ${{ env.VERSION }}
-        run: make push-local-images
+  release-ok:
+    # The single gate proving the release is complete. Without this job, a run
+    # where every region was skipped still shows up green.
+    name: Release OK
+    needs: push
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # Notifications are auxiliary and must never break the release. If the
+      # secrets are missing, skip instead of failing - and `release-ok` declares
+      # no environment, so it only sees repo/org-level secrets, unlike the push
+      # job.
+      - name: Check notification config
+        id: tg
+        run: |
+          if [ -n '${{ secrets.TELEGRAM_TOKEN }}' ] && [ -n '${{ secrets.TELEGRAM_TO }}' ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::TELEGRAM_TO / TELEGRAM_TOKEN not visible in this scope, skipping notifications."
+          fi
+
+      # needs.push.result is the AGGREGATE of the whole matrix: `success` when
+      # every leg that ran succeeded (legs skipped by a single-region choice do
+      # not spoil it), `failure` when any leg broke, `skipped` when no leg ran.
+      # This job fails closed: anything other than success blocks.
+      - name: Verify every requested region was pushed
+        run: |
+          RESULT='${{ needs.push.result }}'
+          echo "Requested regions: ${{ inputs.regions }}"
+          echo "Push matrix result: ${RESULT}"
+
+          if [ "${RESULT}" != "success" ]; then
+            echo "::error::The release is INCOMPLETE (push matrix result: ${RESULT}). Check the individual legs to see which region is missing, and re-run for that region."
+            exit 1
+          fi
+
+          if [ '${{ inputs.regions }}' != 'ALL' ]; then
+            echo "::warning::Only region ${{ inputs.regions }} was pushed. A complete release must exist in BOTH HCM and HAN."
+          fi
+
+      - name: Notify success
+        if: steps.tg.outputs.enabled == 'true'
+        uses: appleboy/telegram-action@master
+        with:
+          to: ${{ secrets.TELEGRAM_TO }}
+          token: ${{ secrets.TELEGRAM_TOKEN }}
+          format: markdown
+          message: |
+            *[PROD] RELEASE OK*
+            *Repository*: `${{ github.repository }}`
+            *Version*: `${{ inputs.version }}`
+            *Regions*: `${{ inputs.regions }}`
+            *Author*: `${{ github.actor }}`
+            *Workflow*: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

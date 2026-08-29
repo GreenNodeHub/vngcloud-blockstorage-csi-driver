@@ -1,0 +1,28 @@
+version: "2"
+
+# v2 config following control-plane. Lint only blocks NEW code in PRs
+# (only-new-issues in CI), so the linter set stays standard plus a few
+# high-value ones, without gating the pre-existing blockstorage-csi codebase
+# (forked from cloud-provider-openstack).
+
+linters:
+  default: standard
+  enable:
+    - misspell
+    - unconvert
+    - goconst
+    - gocritic
+
+issues:
+  max-issues-per-linter: 0
+
+formatters:
+  enable:
+    - gofmt
+    - gci
+  settings:
+    gci:
+      sections:
+        - standard
+        - default
+        - prefix(github.com/vngcloud/vngcloud-blockstorage-csi-driver)

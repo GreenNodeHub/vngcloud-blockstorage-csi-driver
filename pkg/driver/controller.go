@@ -301,7 +301,7 @@ func (s *controllerService) DeleteVolume(pctx lctx.Context, preq *lcsi.DeleteVol
 		return nil, ErrDeleteVolumeHavingSnapshots(volumeID)
 	}
 
-	if err := s.cloud.DeleteVolume(volumeID); err != nil {
+	if err := s.cloud.DeleteVolume(pctx, volumeID); err != nil {
 		if err != nil {
 			llog.ErrorS(err.GetError(), "[ERROR] - DeleteVolume: Failed to delete volume", "volumeID", volumeID)
 			return nil, ErrFailedToDeleteVolume(volumeID)
@@ -338,7 +338,7 @@ func (s *controllerService) ControllerPublishVolume(pctx lctx.Context, preq *lcs
 	llog.InfoS("[INFO] - ControllerPublishVolume: attaching volume into the instance", "volumeID", volumeID, "nodeID", nodeID)
 
 	// Attach the volume and wait for it to be attached
-	_, ierr := s.cloud.AttachVolume(nodeID, volumeID)
+	_, ierr := s.cloud.AttachVolume(pctx, nodeID, volumeID)
 	if ierr != nil {
 		llog.ErrorS(ierr.GetError(), "[ERROR] - ControllerPublishVolume; failed to attach volume to instance", "volumeID", volumeID, "nodeID", nodeID)
 		return nil, ErrAttachVolume(volumeID, nodeID)
@@ -354,7 +354,7 @@ func (s *controllerService) ControllerPublishVolume(pctx lctx.Context, preq *lcs
 	return newControllerPublishVolumeResponse(devicePath), nil
 }
 
-func (s *controllerService) ControllerUnpublishVolume(_ lctx.Context, preq *lcsi.ControllerUnpublishVolumeRequest) (*lcsi.ControllerUnpublishVolumeResponse, error) {
+func (s *controllerService) ControllerUnpublishVolume(pctx lctx.Context, preq *lcsi.ControllerUnpublishVolumeRequest) (*lcsi.ControllerUnpublishVolumeResponse, error) {
 	llog.InfoS("[INFO] - ControllerUnpublishVolume: Called", "request", *preq)
 
 	if err := validateControllerUnpublishVolumeRequest(preq); err != nil {
@@ -377,7 +377,7 @@ func (s *controllerService) ControllerUnpublishVolume(_ lctx.Context, preq *lcsi
 		s.inFlight.Delete(volumeID + nodeID)
 	}()
 
-	if ierr := s.cloud.DetachVolume(nodeID, volumeID); ierr != nil {
+	if ierr := s.cloud.DetachVolume(pctx, nodeID, volumeID); ierr != nil {
 		llog.ErrorS(ierr.GetError(), "[ERROR] - ControllerUnpublishVolume: Failed to detach volume from instance", "volumeID", volumeID, "nodeID", nodeID)
 		return nil, ErrDetachVolume(volumeID, nodeID)
 	}
@@ -517,7 +517,7 @@ func (s *controllerService) ControllerGetCapabilities(ctx lctx.Context, req *lcs
 	return &lcsi.ControllerGetCapabilitiesResponse{Capabilities: caps}, nil
 }
 
-func (s *controllerService) ControllerExpandVolume(_ lctx.Context, preq *lcsi.ControllerExpandVolumeRequest) (*lcsi.ControllerExpandVolumeResponse, error) {
+func (s *controllerService) ControllerExpandVolume(pctx lctx.Context, preq *lcsi.ControllerExpandVolumeRequest) (*lcsi.ControllerExpandVolumeResponse, error) {
 	llog.V(4).InfoS("[INFO] - ControllerExpandVolume: Called", "request", *preq)
 
 	volumeID := preq.GetVolumeId()
@@ -571,7 +571,7 @@ func (s *controllerService) ControllerExpandVolume(_ lctx.Context, preq *lcsi.Co
 
 	llog.V(5).InfoS("ControllerExpandVolume: expanding volume", "volumeID", volumeID, "newSize", volSizeGB)
 	// Expand the volume
-	err1 := s.cloud.ExpandVolume(volumeID, volume.VolumeTypeID, volSizeGB)
+	err1 := s.cloud.ExpandVolume(pctx, volumeID, volume.VolumeTypeID, volSizeGB)
 	if err1 != nil {
 		llog.ErrorS(err1, "ControllerExpandVolume: failed to expand volume", "volumeID", volumeID)
 		return nil, ErrFailedToExpandVolume(volumeID, int64(volSizeGB))
@@ -642,7 +642,7 @@ func (s *controllerService) ModifyVolumeProperties(pctx lctx.Context, preq *lvmr
 	}
 
 	llog.InfoS("[INFO] - ModifyVolumeProperties: Modifying volume", "volumeID", volumeID, "newVolumeType", options.VolumeType, "oldVolumeType", volume.VolumeTypeID, "newSize", volume.Size)
-	ierr := s.cloud.ModifyVolumeType(volumeID, volumeTypeId, int(volume.Size))
+	ierr := s.cloud.ModifyVolumeType(pctx, volumeID, volumeTypeId, int(volume.Size))
 	if ierr != nil {
 		llog.ErrorS(ierr.GetError(), "ModifyVolumeProperties: failed to modify volume", "volumeID", volumeID)
 		return nil, ierr.GetError()

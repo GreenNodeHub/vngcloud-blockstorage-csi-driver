@@ -17,12 +17,32 @@ jobs:
     # The type of runner that the job will run on
     runs-on: ubuntu-latest
     environment:
-      name: development  # Set the environment name
+      # `develop`, not `development`. The VCR_DEV_REGISTRY variable and the two
+      # VCR_DEV_USERNAME/PASSWORD secrets live in the environment named
+      # `develop`, matching the vngcloud-manage-csi-driver convention. The
+      # workflow used to point at `development` - an empty environment - so
+      # REGISTRY resolved to an empty string and docker build failed with
+      # "invalid reference format".
+      name: develop
     # Only trigger the workflow if the commit message contains '[build]'
     if: contains(github.event.head_commit.message, '[build]' || contains(github.event.head_commit.message, 'Merge branch'))
     # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
+      # Notifications are auxiliary. The telegram step used to come FIRST and
+      # unguarded: missing TELEGRAM_TO/TELEGRAM_TOKEN killed the job right
+      # there, every remaining step was skipped and no image was ever built.
+      - name: Check notification config
+        id: tg
+        run: |
+          if [ -n '${{ secrets.TELEGRAM_TOKEN }}' ] && [ -n '${{ secrets.TELEGRAM_TO }}' ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::TELEGRAM_TO / TELEGRAM_TOKEN not set, skipping notifications."
+          fi
+
       - name: Send alert that a new commit has been created
+        if: steps.tg.outputs.enabled == 'true'
         uses: appleboy/telegram-action@master
         with:
           to: ${{ secrets.TELEGRAM_TO }}
@@ -43,14 +63,50 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: dev
-      # Runs a set of commands using the runners shell
+
+      # The image tag is also the VERSION injected into ldflags:
+      #   Makefile:40  -X k8s.io/component-base/version.gitVersion=$(VERSION)
+      # component-base parses that string with ^v(\d+\.\d+\.\d+) inside the
+      # package init() of legacyregistry and PANICS on a mismatch - before
+      # main(), where nothing can recover. The tag MUST start with vN.N.N; the
+      # regex is not end-anchored, so the suffix is free.
+      #
+      # Previously the tag was a hardcoded "v0.0.0" for EVERY dev build: no way
+      # to tell which commit an image came from, no way to roll back.
+      - id: tag
+        run: echo "tag=v0.0.0-dev-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      # REGISTRY must be passed in: the Makefile defaults to
+      # REGISTRY ?= vcr.vngcloud.vn/60108-cuongdm3 (a personal namespace), so
+      # leaving it unset makes the build tag the image there while the push
+      # step pushes to VCR_DEV_REGISTRY - two different paths, and the thing
+      # being pushed was never built.
+      #
+      # continue-on-error removed: a broken build carrying on into the push
+      # only surfaces the failure one step away from its real cause.
+      # Report a clear error instead of letting docker fail with
+      # "invalid reference format" when REGISTRY is empty.
+      - name: Verify registry config
+        run: |
+          if [ -z '${{ vars.VCR_DEV_REGISTRY }}' ]; then
+            echo "::error::VCR_DEV_REGISTRY is empty in environment 'develop'. Set it in Settings -> Environments -> develop."
+            exit 1
+          fi
+          if [ -z '${{ secrets.VCR_DEV_USERNAME }}' ] || [ -z '${{ secrets.VCR_DEV_PASSWORD }}' ]; then
+            echo "::error::Missing secret VCR_DEV_USERNAME / VCR_DEV_PASSWORD in environment 'develop'."
+            exit 1
+          fi
+          echo "Registry: ${{ vars.VCR_DEV_REGISTRY }}"
+
       - name: Containerize the application
-        continue-on-error: true
+        env:
+          REGISTRY: ${{ vars.VCR_DEV_REGISTRY }}
+          VERSION: ${{ steps.tag.outputs.tag }}
         run: |
           make build-local-images
       - name: Send alert that the image has been built failed
+        if: failure() && steps.tg.outputs.enabled == 'true'
         uses: appleboy/telegram-action@master
-        if: ${{ failure() }}
         with:
           to: ${{ secrets.TELEGRAM_TO }}
           token: ${{ secrets.TELEGRAM_TOKEN }}
@@ -67,8 +123,8 @@ jobs:
             *See changes*: https://github.com/${{ github.repository }}/commit/${{github.sha}}
             *See workflow*: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
       - name: Send alert that the image has been built success
+        if: success() && steps.tg.outputs.enabled == 'true'
         uses: appleboy/telegram-action@master
-        if: ${{ success() }}
         with:
           to: ${{ secrets.TELEGRAM_TO }}
           token: ${{ secrets.TELEGRAM_TOKEN }}
@@ -77,7 +133,7 @@ jobs:
             📦 *SUCCESS*
             *Repository*: `${{ github.repository }}`
             *Author*: `${{ github.actor }}`
-            *Action*: The `vngcloud-blockstorage-csi-driver:${{ env.VERSION }}` image is built successfully, try to push it to VngCloud Registry
+            *Action*: The `vngcloud-blockstorage-csi-driver:${{ steps.tag.outputs.tag }}` image is built successfully, try to push it to VngCloud Registry
             *Commit message*:
             ```
             ${{ github.event.commits[0].message }}
@@ -91,12 +147,11 @@ jobs:
           username: ${{ secrets.VCR_DEV_USERNAME }}
           password: ${{ secrets.VCR_DEV_PASSWORD }}
       - name: Push to vcr.vngcloud.vn
-        continue-on-error: true
         run: |
-          docker image push ${{ vars.VCR_DEV_REGISTRY }}/vngcloud-blockstorage-csi-driver:v0.0.0
+          docker image push ${{ vars.VCR_DEV_REGISTRY }}/vngcloud-blockstorage-csi-driver:${{ steps.tag.outputs.tag }}
       - name: Send alert that the image has been pushed failed
+        if: failure() && steps.tg.outputs.enabled == 'true'
         uses: appleboy/telegram-action@master
-        if: ${{ failure() }}
         with:
           to: ${{ secrets.TELEGRAM_TO }}
           token: ${{ secrets.TELEGRAM_TOKEN }}
@@ -113,8 +168,8 @@ jobs:
             *See changes*: https://github.com/${{ github.repository }}/commit/${{github.sha}}
             *See workflow*: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
       - name: Send alert that the image has been pushed success
+        if: success() && steps.tg.outputs.enabled == 'true'
         uses: appleboy/telegram-action@master
-        if: ${{ success() }}
         with:
           to: ${{ secrets.TELEGRAM_TO }}
           token: ${{ secrets.TELEGRAM_TOKEN }}
@@ -123,7 +178,7 @@ jobs:
             🛸 *SUCCESS*
             *Repository*: `${{ github.repository }}`
             *Author*: `${{ github.actor }}`
-            *Action*: The `vngcloud-blockstorage-csi-driver:${{ env.VERSION }}` image is pushed successfully to VngCloud registry
+            *Action*: The `vngcloud-blockstorage-csi-driver:${{ steps.tag.outputs.tag }}` image is pushed successfully to VngCloud registry
             *Commit message*:
             ```
             ${{ github.event.commits[0].message }}

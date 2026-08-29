@@ -525,7 +525,15 @@ func (s *nodeService) NodeGetInfo(_ lctx.Context, _ *lcsi.NodeGetInfoRequest) (*
 			WithIamEndpoint(s.driverOptions.identityURL).
 			WithVServerEndpoint(s.driverOptions.vServerURL)
 
-		cloudClient := lsdkClientV2.NewClient(lctx.TODO()).Configure(clientCfg)
+		// Go through the same throttled http client as the controller. The node
+		// plugin is a separate process so this is a separate limiter, but
+		// skipping it entirely would leave the whole DaemonSet's traffic
+		// uncounted against the shared per-project bucket - and NodeGetInfo
+		// fan-out during a node-group scale-up is precisely what drains it.
+		// WithHttpClient must be called before Configure.
+		cloudClient := lsdkClientV2.NewClient(lctx.TODO()).
+			WithHttpClient(lscloud.NewThrottledHTTPClient(lctx.TODO())).
+			Configure(clientCfg)
 
 		klog.V(5).InfoS("[DEBUG] - NodeGetInfo: Get the portal info and quota")
 		portal, sdkErr := cloudClient.VServerGateway().V1().PortalService().

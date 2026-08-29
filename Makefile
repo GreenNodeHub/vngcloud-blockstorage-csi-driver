@@ -67,8 +67,10 @@ $(BUILD_CMDS): $(SOURCES)
 
 test: unit functional
 
+# Same version as CI (.github/workflows/ci.yml). The .golangci.yml here is in
+# v2 config format and CANNOT be read by golangci-lint v1.x.
 check: work
-	go run github.com/golangci/golangci-lint/cmd/golangci-lint@v1.56.0 run ./...
+	go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 run ./...
 
 unit: work
 	go test -tags=unit $(shell go list ./... | sed -e '/sanity/ { N; d; }' | sed -e '/tests/ {N; d;}') $(TESTARGS)

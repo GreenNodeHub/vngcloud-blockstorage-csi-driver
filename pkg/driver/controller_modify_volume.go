@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/vngcloud/vngcloud-blockstorage-csi-driver/pkg/cloud"
+	"sync"
+	"time"
+
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"k8s.io/klog/v2"
-	"sync"
-	"time"
+
+	"github.com/vngcloud/vngcloud-blockstorage-csi-driver/pkg/cloud"
 )
 
 type modifyVolumeManager struct {
@@ -158,12 +160,16 @@ func (h *modifyVolumeRequestHandler) mergeModifyVolumeRequest(r *modifyVolumeReq
 }
 
 func (s *controllerService) executeModifyVolumeRequest(volumeID string, req *modifyVolumeRequest) (int64, error) {
-	_, cancel := context.WithTimeout(context.Background(), DefaultTimeoutModifyChannel)
-	defer func() {
-		klog.Errorf("Cancel has been called for the context.")
-		cancel()
-	}()
-	actualSizeGiB, err := s.cloud.ResizeOrModifyDisk(volumeID, req.newSize, &req.modifyDiskOptions)
+	// This context used to be created and thrown away (`_, cancel := ...`), so
+	// DefaultTimeoutModifyChannel had no effect at all. It is now passed down.
+	// The caller's ctx is deliberately not used, because one request here may
+	// have been coalesced from several callers; aws-ebs-csi-driver does exactly
+	// the same in its executeModifyVolumeRequest, except with 15s instead of 10
+	// minutes.
+	ctx, cancel := context.WithTimeout(context.Background(), DefaultTimeoutModifyChannel)
+	defer cancel()
+
+	actualSizeGiB, err := s.cloud.ResizeOrModifyDisk(ctx, volumeID, req.newSize, &req.modifyDiskOptions)
 	if err != nil {
 		klog.ErrorS(err, "Failed to modify volume", "volumeID", volumeID)
 		return 0, err
