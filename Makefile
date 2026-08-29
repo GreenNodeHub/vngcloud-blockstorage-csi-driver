@@ -59,7 +59,7 @@ build-all-archs:
 build: $(BUILD_CMDS)
 
 $(BUILD_CMDS): $(SOURCES)
-	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) GOPROXY=${GOPROXY} go build \
+	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) GOPROXY="$(GOPROXY)" go build \
 		-trimpath \
 		-ldflags $(LDFLAGS) \
 		-o $@ \
