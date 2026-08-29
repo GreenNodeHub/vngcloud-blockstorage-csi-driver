@@ -147,23 +147,19 @@ func (s *adaptiveRateLimiter) currentQPS() float64 {
 // wait acquires one token. Returns false when the wait would exceed
 // rateLimitMaxWait - the caller should then fail fast for the CO to retry
 // rather than sleep while holding the inflight lock.
+//
+// Implemented with Limiter.Wait over an internal deadline instead of a
+// hand-rolled Reserve/Delay/Cancel/Sleep: Wait returns tokens correctly when
+// the deadline preempts it, whereas Reserve+Cancel under-returns once later
+// reservations exist, so a burst of shed attempts would permanently burn
+// bucket capacity and push genuine waiters over the threshold. (DoRequest has
+// no caller context to thread in - the SDK interface does not carry one - so
+// the deadline here is the best available bound.)
 func (s *adaptiveRateLimiter) wait() bool {
-	res := s.limiter.Reserve()
-	if !res.OK() {
-		return false
-	}
+	ctx, cancel := lctx.WithTimeout(lctx.Background(), rateLimitMaxWait)
+	defer cancel()
 
-	delay := res.Delay()
-	if delay > rateLimitMaxWait {
-		res.Cancel()
-		return false
-	}
-
-	if delay > 0 {
-		ltime.Sleep(delay)
-	}
-
-	return true
+	return s.limiter.Wait(ctx) == nil
 }
 
 // isThrottled reads the raw statusCode the SDK stashes in the IError

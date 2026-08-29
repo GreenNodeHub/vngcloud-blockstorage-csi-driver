@@ -200,8 +200,21 @@ func (s *cloud) AttachVolume(pctx lctx.Context, pinstanceId, pvolumeId string) (
 	}
 
 	if vol.AttachedTheInstance(pinstanceId) {
-		llog.InfoS("[INFO] - AttachVolume: The volume is already attached", "volumeId", pvolumeId, "instanceId", pinstanceId)
-		return lsentity.NewVolume(vol), nil
+		// Fully attached only when the status is IN-USE too. A retry landing
+		// while the volume is still transitional (VmId set, status ATTACHING/
+		// PROCESSING) must NOT report success yet - ControllerPublishVolume
+		// would hand out a devicePath for a block device that does not exist on
+		// the VM. The attach is already in flight, so skip the mutate and just
+		// wait; the same predicate waitDiskAttached uses.
+		if vol.Status == VolumeInUseStatus {
+			llog.InfoS("[INFO] - AttachVolume: The volume is already attached", "volumeId", pvolumeId, "instanceId", pinstanceId)
+			return lsentity.NewVolume(vol), nil
+		}
+
+		llog.InfoS("[INFO] - AttachVolume: Attach already in flight, waiting",
+			"volumeId", pvolumeId, "instanceId", pinstanceId, "status", vol.Status)
+
+		return s.waitDiskAttached(pctx, pinstanceId, pvolumeId)
 	}
 
 	// Issue the attach exactly once. If the ctx expires during the poll, the CO
@@ -212,9 +225,17 @@ func (s *cloud) AttachVolume(pctx lctx.Context, pinstanceId, pvolumeId string) (
 		AttachBlockVolume(lsdkComputeV2.NewAttachBlockVolumeRequest(pinstanceId, pvolumeId)); sdkErr != nil {
 		switch sdkErr.GetErrorCode() {
 		case lsdkErrs.EcVServerVolumeAlreadyAttachedThisServer:
-			// Goal already reached.
+			// Goal already reached - fall through to the wait to confirm IN-USE.
 		case lsdkErrs.EcVServerVolumeInProcess:
-			llog.InfoS("[INFO] - AttachVolume: The volume is in process, waiting", "volumeId", pvolumeId)
+			// The IaaS REJECTED the attach because another operation owns the
+			// volume - nothing was queued, so waiting here would poll for an
+			// attach nobody is performing, burning the whole sidecar budget
+			// while holding the inflight lock. Return instead; the CO retries
+			// and the next RPC re-reads state and re-issues.
+			llog.InfoS("[INFO] - AttachVolume: The volume is busy, returning for the CO to retry",
+				"volumeId", pvolumeId, "errorCode", sdkErr.GetStringErrorCode())
+
+			return nil, lserr.ErrVolumeFailedToAttach(pinstanceId, pvolumeId, sdkErr)
 		default:
 			ierr = lserr.ErrVolumeFailedToAttach(pinstanceId, pvolumeId, sdkErr)
 			llog.ErrorS(ierr.GetError(), "[ERROR] - AttachVolume: Failed to attach the volume", ierr.GetListParameters()...)
@@ -235,8 +256,7 @@ func (s *cloud) AttachVolume(pctx lctx.Context, pinstanceId, pvolumeId string) (
 // not exist", both misdirecting diagnosis and making the caller give up
 // instead of retrying.
 func (s *cloud) getVolumeForAttach(pvolumeId string) (*lsdkEntity.Volume, lserr.IError) {
-	vol, sdkErr := s.client.VServerGateway().V2().VolumeService().
-		GetBlockVolumeById(lsdkVolumeV2.NewGetBlockVolumeByIdRequest(pvolumeId))
+	vol, sdkErr := s.getVolumeById(pvolumeId)
 	if sdkErr != nil {
 		if sdkErr.IsError(lsdkErrs.EcVServerVolumeNotFound) {
 			ierr := lserr.ErrVolumeNotFound(pvolumeId)
@@ -268,8 +288,7 @@ func (s *cloud) getVolumeForAttach(pvolumeId string) (*lsdkEntity.Volume, lserr.
 // volume must return nil, never an error - otherwise external-attacher never
 // gets to remove the VolumeAttachment finalizer.
 func (s *cloud) DetachVolume(pctx lctx.Context, pinstanceId, pvolumeId string) lserr.IError {
-	vol, sdkErr := s.client.VServerGateway().V2().VolumeService().
-		GetBlockVolumeById(lsdkVolumeV2.NewGetBlockVolumeByIdRequest(pvolumeId))
+	vol, sdkErr := s.getVolumeById(pvolumeId)
 	if sdkErr != nil {
 		if sdkErr.IsError(lsdkErrs.EcVServerVolumeNotFound) {
 			llog.InfoS("[INFO] - DetachVolume: The volume no longer exists, treat as detached", "volumeId", pvolumeId)
@@ -306,8 +325,17 @@ func (s *cloud) DetachVolume(pctx lctx.Context, pinstanceId, pvolumeId string) l
 
 			return nil
 		case errSetDetachRetryable.ContainsOne(sdkErr.GetErrorCode()):
-			llog.InfoS("[INFO] - DetachVolume: The volume is busy, waiting", "volumeId", pvolumeId,
-				"errorCode", sdkErr.GetStringErrorCode())
+			// The IaaS REJECTED the detach because another operation owns the
+			// volume - nothing was queued. Falling into the read-only wait here
+			// would poll for a detach nobody is performing: if the busy
+			// operation is not itself a detach, the volume settles back to
+			// attached and the poll burns the whole sidecar budget while
+			// holding the inflight lock. Return instead; the CO retries and
+			// the next RPC re-reads state and re-issues.
+			llog.InfoS("[INFO] - DetachVolume: The volume is busy, returning for the CO to retry",
+				"volumeId", pvolumeId, "errorCode", sdkErr.GetStringErrorCode())
+
+			return lserr.ErrVolumeFailedToDetach(pinstanceId, pvolumeId, sdkErr)
 		default:
 			ierr := lserr.ErrVolumeFailedToDetach(pinstanceId, pvolumeId, sdkErr)
 			llog.ErrorS(ierr.GetError(), "[ERROR] - DetachVolume: Failed to detach the volume", ierr.GetListParameters()...)
@@ -335,7 +363,7 @@ func (s *cloud) ResizeOrModifyDisk(pctx lctx.Context, volumeID string, newSizeBy
 	}
 
 	// Check that we need to modify this volume`
-	needsModification, volumeSize, err := s.validateModifyVolume(pctx, volumeID, newSizeGiB, options)
+	needsModification, volumeSize, err := s.validateModifyVolume(pctx, volume, volumeID, newSizeGiB, options)
 	if err != nil || !needsModification {
 		return volumeSize, err
 	}
@@ -346,7 +374,7 @@ func (s *cloud) ResizeOrModifyDisk(pctx lctx.Context, volumeID string, newSizeBy
 		return 0, sdkErr2.GetError()
 	} else if !same && !volume.IsAttched() {
 		// The target volume type lives in another zone => migrate before resizing.
-		if ierr := s.migrateVolumeToType(pctx, volumeID, options.VolumeType); ierr != nil {
+		if ierr := s.migrateVolumeToType(pctx, volume, volumeID, options.VolumeType); ierr != nil {
 			return 0, ierr.GetError()
 		}
 	}
@@ -357,13 +385,13 @@ func (s *cloud) ResizeOrModifyDisk(pctx lctx.Context, volumeID string, newSizeBy
 		return 0, sdkErr.GetError()
 	}
 
-	_, err = s.waitVolumeAchieveStatus(pctx, volumeID, volumeArchivedStatus)
+	settled, err := s.waitVolumeAchieveStatus(pctx, volumeID, volumeArchivedStatus)
 	if err != nil {
 		return 0, err
 	}
 
-	// Perform one final check on the volume
-	return s.checkDesiredState(volumeID, newSizeGiB, options)
+	// Perform one final check on the volume the wait just observed - no extra GET.
+	return checkDesiredState(settled, volumeID, newSizeGiB, options)
 }
 
 // migrateVolumeToType moves the volume to a volume type in another zone and
@@ -376,13 +404,9 @@ func (s *cloud) ResizeOrModifyDisk(pctx lctx.Context, volumeID string, newSizeBy
 // Previously the migrate command sat inside the poll loop, and that loop used
 // NewBackOff(10, 10, true, 30m): with Revert=true the FIRST sleep is
 // floor((2^9-1)/2) = 255 seconds, while csi-resizer only waits 60.
-func (s *cloud) migrateVolumeToType(pctx lctx.Context, pvolumeId, ptargetType string) lserr.IError {
-	raw, sdkErr := s.getVolumeById(pvolumeId)
-	if sdkErr != nil {
-		return lserr.ErrVolumeFailedToGet(pvolumeId, sdkErr)
-	}
-
-	vol := lsentity.NewVolume(raw)
+// The caller passes the volume it already holds - this used to be the third
+// sequential GET of the same object on the modify path.
+func (s *cloud) migrateVolumeToType(pctx lctx.Context, vol *lsentity.Volume, pvolumeId, ptargetType string) lserr.IError {
 	if isMigratedToType(vol, ptargetType) {
 		llog.InfoS("[INFO] - migrateVolumeToType: The volume is already on the target type",
 			"volumeId", pvolumeId, "volumeType", ptargetType)

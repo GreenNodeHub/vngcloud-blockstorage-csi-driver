@@ -1,6 +1,7 @@
 package cloud
 
 import (
+	lctx "context"
 	ltesting "testing"
 	ltime "time"
 
@@ -9,6 +10,7 @@ import (
 	lwait "k8s.io/apimachinery/pkg/util/wait"
 
 	lsentity "github.com/vngcloud/vngcloud-blockstorage-csi-driver/pkg/cloud/entity"
+	lserr "github.com/vngcloud/vngcloud-blockstorage-csi-driver/pkg/cloud/errors"
 )
 
 const (
@@ -183,5 +185,42 @@ func TestBackoffsStartFastAndDeclareNoCap(t *ltesting.T) {
 			t.Errorf("%s: only %d polls within the first 60s", name, in60s)
 		}
 		t.Logf("%s: %d polls, %v total, %d within the first 60s", name, polls, total.Round(ltime.Millisecond), in60s)
+	}
+}
+
+// TestErrorConstructorsTolerateNilSdkErr pins the fix for the worst review
+// finding: every wait-timeout path builds these errors with psdkErr == nil, and
+// the constructors used to call GetError()/GetParameters() on the nil
+// interface - a panic that killed the whole controller pod on any timeout,
+// since the gRPC server has no recovery interceptor.
+func TestErrorConstructorsTolerateNilSdkErr(t *ltesting.T) {
+	waitErr := lctx.DeadlineExceeded
+
+	for name, build := range map[string]func() lserr.IError{
+		"ErrVolumeFailedToAttach": func() lserr.IError {
+			return lserr.ErrVolumeFailedToAttach(testInstanceA, "vol-x", nil)
+		},
+		"ErrVolumeFailedToDetach": func() lserr.IError {
+			return lserr.ErrVolumeFailedToDetach(testInstanceA, "vol-x", nil)
+		},
+		"ErrVolumeFailedToDelete": func() lserr.IError {
+			return lserr.ErrVolumeFailedToDelete("vol-x", nil)
+		},
+		"ErrVolumeFailedToGet": func() lserr.IError {
+			return lserr.ErrVolumeFailedToGet("vol-x", nil)
+		},
+	} {
+		t.Run(name, func(t *ltesting.T) {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("panicked with nil psdkErr: %v", r)
+				}
+			}()
+
+			ierr := build().WithErrors(waitErr)
+			if ierr.GetError() == nil {
+				t.Fatal("GetError() = nil after WithErrors - a caller doing `return ierr.GetError()` reports false success")
+			}
+		})
 	}
 }
