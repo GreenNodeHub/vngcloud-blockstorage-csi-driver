@@ -1,27 +1,27 @@
 name: Release PROD - Build & Push Image
 
-# Mot ban release phai co mat o CA HAI region (HCM va HAN). Moi region co URL
-# registry, username va password rieng.
+# A release must exist in BOTH regions (HCM and HAN). Each region has its own
+# registry URL, username and password.
 #
-# Bo cuc: validate -> build MOT LAN -> push song song theo matrix -> chot.
+# Shape: validate -> build ONCE -> push in parallel via the matrix -> gate.
 #
-# Vi sao build mot lan roi day di hai noi, thay vi build lai cho tung region:
-# hai lan `make build-local-images` tao ra hai image khac nhau (timestamp, thu
-# tu layer), nen hai region se chay hai binary khac nhau duoi cung mot tag. Build
-# mot lan rong `docker save` rieng ra artifact dam bao ca hai region nhan dung
-# cung mot noi dung.
+# Why build once and push twice, instead of rebuilding per region: two runs of
+# `make build-local-images` produce two different images (timestamps, layer
+# ordering), so the two regions would run different binaries under the same
+# tag. Building once and `docker save`-ing to an artifact guarantees both
+# regions receive byte-identical content.
 #
-# Them mot region moi = them mot muc trong matrix `region` ben duoi, khong phai
-# copy them ba step.
+# Adding a region = adding one entry to the `region` matrix below, not copying
+# three more steps.
 
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Tag version to build (phai bat dau bang vN.N.N)'
+        description: 'Tag version to build (must start with vN.N.N)'
         required: true
       regions:
-        description: 'Region can day len'
+        description: 'Regions to push to'
         required: true
         default: 'ALL'
         type: choice
@@ -32,7 +32,7 @@ on:
 
 env:
   IMAGE_NAME: vngcloud-blockstorage-csi-driver
-  # Tag cuc bo dung trong luc build, truoc khi gan lai theo tung registry.
+  # Local tag used during the build, before retagging per registry.
   LOCAL_REF: localhost/release/vngcloud-blockstorage-csi-driver
 
 jobs:
@@ -45,18 +45,18 @@ jobs:
         with:
           fetch-depth: 0
 
-      # Tag anh cung chinh la VERSION nhet vao ldflags:
+      # The image tag is also the VERSION injected into ldflags:
       #   Makefile:40  -X k8s.io/component-base/version.gitVersion=$(VERSION)
-      # component-base parse chuoi do bang regex ^v(\d+\.\d+\.\d+) NGAY TRONG
-      # init() cua legacyregistry va panic neu khong khop - truoc ca main(), nen
-      # khong co cach nao bat duoc. Mot ban release go thieu chu "v" se day len
-      # ca hai region mot image crash-loop.
+      # component-base parses that string with ^v(\d+\.\d+\.\d+) INSIDE the
+      # init() of legacyregistry and panics on a mismatch - before main(),
+      # where nothing can recover. A release typed without the "v" would ship
+      # a crash-looping image to both regions.
       - name: Version must start with vN.N.N
         run: |
           VERSION='${{ inputs.version }}'
           echo "Version: ${VERSION}"
           if ! printf '%s' "${VERSION}" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+'; then
-            echo "::error::Version '${VERSION}' khong khop ^v[0-9]+\.[0-9]+\.[0-9]+ - binary se panic ngay trong init() cua k8s.io/component-base/metrics/legacyregistry."
+            echo "::error::Version '${VERSION}' does not match ^v[0-9]+\.[0-9]+\.[0-9]+ - the binary would panic inside init() of k8s.io/component-base/metrics/legacyregistry."
             exit 1
           fi
 
@@ -64,10 +64,45 @@ jobs:
         run: |
           VERSION='${{ inputs.version }}'
           if ! git rev-parse -q --verify "refs/tags/${VERSION}" >/dev/null; then
-            echo "::error::Khong tim thay git tag '${VERSION}'. Tao tag truoc khi release."
+            echo "::error::Git tag '${VERSION}' not found. Create the tag before releasing."
             exit 1
           fi
           echo "Tag ${VERSION} -> $(git rev-parse --short "refs/tags/${VERSION}")"
+
+  plan:
+    # Filter regions IN THE MATRIX ITSELF instead of a job-level `if:`.
+    # `matrix` is not among the contexts GitHub allows in jobs.<id>.if (only
+    # github / needs / vars / inputs), so a condition like
+    # `inputs.regions == matrix.region.name` makes the whole file unparseable -
+    # GitHub creates a failed run with no jobs, named after the file path.
+    name: Plan regions
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - id: plan
+        env:
+          REGIONS: ${{ inputs.regions }}
+        run: |
+          ALL='[
+            {"name":"HCM","registry_var":"VCR_REGISTRY","username_secret":"VCR_USERNAME","password_secret":"VCR_PASSWORD"},
+            {"name":"HAN","registry_var":"VCR_HAN_REGISTRY","username_secret":"VCR_HAN_USERNAME","password_secret":"VCR_HAN_PASSWORD"}
+          ]'
+          if [ "${REGIONS}" = "ALL" ]; then
+            M=$(printf '%s' "${ALL}" | jq -c '.')
+          else
+            M=$(printf '%s' "${ALL}" | jq -c --arg r "${REGIONS}" 'map(select(.name == $r))')
+          fi
+
+          if [ "$(printf '%s' "${M}" | jq 'length')" -eq 0 ]; then
+            echo "::error::No region matches '${REGIONS}'."
+            exit 1
+          fi
+
+          echo "matrix=${M}" >> "$GITHUB_OUTPUT"
+          printf '%s' "${M}" | jq -r '.[].name' | sed 's/^/  will push to: /'
 
   build:
     name: Build image once
@@ -80,9 +115,9 @@ jobs:
           ref: refs/tags/${{ inputs.version }}
           fetch-depth: 0
 
-      # REGISTRY phai duoc truyen vao. Makefile mac dinh
-      # REGISTRY ?= vcr.vngcloud.vn/60108-cuongdm3 (namespace ca nhan), de trong
-      # thi image se mang ten do.
+      # REGISTRY must be passed in. The Makefile defaults to
+      # REGISTRY ?= vcr.vngcloud.vn/60108-cuongdm3 (a personal namespace);
+      # leaving it unset would name the image after that.
       - name: Build
         env:
           REGISTRY: localhost/release
@@ -102,29 +137,22 @@ jobs:
 
   push:
     name: Push to ${{ matrix.region.name }}
-    needs: build
-    if: inputs.regions == 'ALL' || inputs.regions == matrix.region.name
+    needs: [build, plan]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: production
     strategy:
-      # Mot region hong khong duoc huy region con lai: neu HAN fail thi HCM van
-      # phai chay xong, de con biet chinh xac cai nao thieu ma day bu.
+      # One broken region must not cancel the other: if HAN fails, HCM still
+      # has to finish, so it is clear exactly which one is missing and needs a
+      # re-push.
       fail-fast: false
       matrix:
-        region:
-          - name: HCM
-            registry_var: VCR_REGISTRY
-            username_secret: VCR_USERNAME
-            password_secret: VCR_PASSWORD
-          - name: HAN
-            registry_var: VCR_HAN_REGISTRY
-            username_secret: VCR_HAN_USERNAME
-            password_secret: VCR_HAN_PASSWORD
+        region: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
-      # Thong bao la phu tro, khong duoc lam hong ban release. Neu thieu secret
-      # thi bo qua chu dung fail - va `release-ok` khong khai environment nen no
-      # chi thay duoc secret cap repo/org, khac voi job push.
+      # Notifications are auxiliary and must never break the release. If the
+      # secrets are missing, skip instead of failing - and `release-ok` declares
+      # no environment, so it only sees repo/org-level secrets, unlike the push
+      # job.
       - name: Check notification config
         id: tg
         run: |
@@ -132,7 +160,7 @@ jobs:
             echo "enabled=true" >> "$GITHUB_OUTPUT"
           else
             echo "enabled=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::TELEGRAM_TO / TELEGRAM_TOKEN khong thay o pham vi nay, bo qua thong bao."
+            echo "::warning::TELEGRAM_TO / TELEGRAM_TOKEN not visible in this scope, skipping notifications."
           fi
 
       - name: Verify region config
@@ -140,11 +168,11 @@ jobs:
           echo "Region:   ${{ matrix.region.name }}"
           echo "Registry: ${{ vars[matrix.region.registry_var] }}"
           if [ -z '${{ vars[matrix.region.registry_var] }}' ]; then
-            echo "::error::Bien ${{ matrix.region.registry_var }} rong o environment 'production'. Dat trong Settings -> Environments."
+            echo "::error::Variable ${{ matrix.region.registry_var }} is empty in environment 'production'. Set it in Settings -> Environments."
             exit 1
           fi
           if [ -z '${{ secrets[matrix.region.username_secret] }}' ] || [ -z '${{ secrets[matrix.region.password_secret] }}' ]; then
-            echo "::error::Thieu secret ${{ matrix.region.username_secret }} / ${{ matrix.region.password_secret }} o environment 'production'."
+            echo "::error::Missing secret ${{ matrix.region.username_secret }} / ${{ matrix.region.password_secret }} in environment 'production'."
             exit 1
           fi
 
@@ -162,10 +190,11 @@ jobs:
           username: ${{ secrets[matrix.region.username_secret] }}
           password: ${{ secrets[matrix.region.password_secret] }}
 
-      # TARGET duoc ghep trong shell chu khong trong khoi `env:`: IMAGE_NAME va
-      # LOCAL_REF la env cua workflow nen chac chan co mat duoi dang bien shell,
-      # con viec tham chieu context `env` ben trong chinh mot khoi `env:` thi de
-      # ra chuoi rong ma khong bao loi - luc do se push nham `registry//:version`.
+      # TARGET is composed in the shell, not in the `env:` block: IMAGE_NAME
+      # and LOCAL_REF are workflow-level env so they are guaranteed to exist as
+      # shell variables, whereas referencing the `env` context inside an `env:`
+      # block itself tends to yield an empty string with no error - and then
+      # `registry//:version` gets pushed.
       - name: Tag and push
         env:
           REGISTRY: ${{ vars[matrix.region.registry_var] }}
@@ -177,9 +206,9 @@ jobs:
           docker image tag "${LOCAL_REF}:${VERSION}" "${TARGET}"
           docker image push "${TARGET}"
 
-          # RepoDigests chi co sau khi push thanh cong. Neu vi ly do nao do no
-          # rong thi chi bo qua phan ghi summary, dung lam fail ca buoc push da
-          # chay xong.
+          # RepoDigests only exists after a successful push. If it is empty for
+          # any reason, just skip the summary write - do not fail a push step
+          # that already completed.
           DIGEST=$(docker image inspect "${TARGET}" --format '{{ if .RepoDigests }}{{ index .RepoDigests 0 }}{{ end }}' || true)
           echo "Pushed: ${TARGET} ${DIGEST:+(${DIGEST})}"
           {
@@ -207,17 +236,18 @@ jobs:
             *Workflow*: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
   release-ok:
-    # Cong duy nhat de biet ban release da tron ven. Khong co job nay thi mot
-    # lan chay ma moi region deu bi skip van hien ra la mau xanh.
+    # The single gate proving the release is complete. Without this job, a run
+    # where every region was skipped still shows up green.
     name: Release OK
     needs: push
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      # Thong bao la phu tro, khong duoc lam hong ban release. Neu thieu secret
-      # thi bo qua chu dung fail - va `release-ok` khong khai environment nen no
-      # chi thay duoc secret cap repo/org, khac voi job push.
+      # Notifications are auxiliary and must never break the release. If the
+      # secrets are missing, skip instead of failing - and `release-ok` declares
+      # no environment, so it only sees repo/org-level secrets, unlike the push
+      # job.
       - name: Check notification config
         id: tg
         run: |
@@ -225,13 +255,13 @@ jobs:
             echo "enabled=true" >> "$GITHUB_OUTPUT"
           else
             echo "enabled=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::TELEGRAM_TO / TELEGRAM_TOKEN khong thay o pham vi nay, bo qua thong bao."
+            echo "::warning::TELEGRAM_TO / TELEGRAM_TOKEN not visible in this scope, skipping notifications."
           fi
 
-      # needs.push.result la ket qua GOP cua ca matrix: `success` khi moi leg
-      # da chay deu thanh cong (leg bi skip vi chon mot region khong lam hong
-      # ket qua nay), `failure` khi co leg hong, `skipped` khi khong leg nao
-      # chay. Job nay fail-closed: bat cu gia tri nao khac success deu chan.
+      # needs.push.result is the AGGREGATE of the whole matrix: `success` when
+      # every leg that ran succeeded (legs skipped by a single-region choice do
+      # not spoil it), `failure` when any leg broke, `skipped` when no leg ran.
+      # This job fails closed: anything other than success blocks.
       - name: Verify every requested region was pushed
         run: |
           RESULT='${{ needs.push.result }}'
@@ -239,12 +269,12 @@ jobs:
           echo "Push matrix result: ${RESULT}"
 
           if [ "${RESULT}" != "success" ]; then
-            echo "::error::Ban release CHUA tron ven (ket qua matrix push: ${RESULT}). Xem tung leg de biet region nao thieu, va chay lai dung region do."
+            echo "::error::The release is INCOMPLETE (push matrix result: ${RESULT}). Check the individual legs to see which region is missing, and re-run for that region."
             exit 1
           fi
 
           if [ '${{ inputs.regions }}' != 'ALL' ]; then
-            echo "::warning::Chi day len region ${{ inputs.regions }}. Mot ban release day du phai co mat o CA HCM va HAN."
+            echo "::warning::Only region ${{ inputs.regions }} was pushed. A complete release must exist in BOTH HCM and HAN."
           fi
 
       - name: Notify success

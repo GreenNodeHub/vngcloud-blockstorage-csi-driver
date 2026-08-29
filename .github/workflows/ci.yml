@@ -1,14 +1,14 @@
 name: CI
 
-# Gate duy nhất cho branch protection là job "CI OK" — thêm/bớt job kiểm tra
-# không cần sửa protection settings.
+# The single branch-protection gate is the "CI OK" job — checks can be added or
+# removed without touching protection settings.
 #
-# Repo này giữ nguyên build_dev.yml / build_prod.yml / release.yml sẵn có cho
-# phần deploy; ci.yml chỉ là cổng chất lượng cho PR vào main.
+# This repo keeps its existing build_dev.yml / build_prod.yml / release.yml for
+# deployment; ci.yml is only the quality gate for PRs into main.
 #
-# KHÁC control-plane: blockstorage-csi KHÔNG cần github token cho private modules —
-# hai dep vngcloud-go-sdk + vngcloud-csi-volume-modifier đều public và có trên
-# Go proxy, nên go build/vet/test resolve qua proxy mà không cần GOPRIVATE/auth.
+# UNLIKE control-plane: blockstorage-csi needs no github token for private
+# modules — both deps (vngcloud-go-sdk, vngcloud-csi-volume-modifier) are public
+# and on the Go proxy, so go build/vet/test resolve without GOPRIVATE/auth.
 
 on:
   pull_request:
@@ -22,7 +22,6 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-        with:
 
       - uses: actions/setup-go@v5
         with:
@@ -40,21 +39,21 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-        with:
 
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
 
-      # blockstorage-csi dùng make unit (lọc sanity/tests packages qua sed) thay vì
-      # go test ./... thô — tránh build test binary cho pkg cần deps ngoài.
+      # blockstorage-csi uses make unit (which filters sanity/tests packages via
+      # sed) instead of raw go test ./... — avoids building test binaries for
+      # packages needing external deps.
       - name: Run tests
         run: make unit
 
   lint:
-    # Chỉ chạy trên PR: only-new-issues so diff với merge-base của PR — repo này
-    # còn nhiều issue cũ, gate chỉ chặn code MỚI.
+    # PR-only: only-new-issues diffs against the PR's merge-base — this repo
+    # carries many pre-existing issues, the gate only blocks NEW code.
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -71,13 +70,13 @@ jobs:
       - name: Lint (new issues only)
         uses: golangci/golangci-lint-action@v8
         with:
-          version: v2.12.2 # pin theo lần chạy xanh đầu tiên (2026-07-29)
+          version: v2.12.2 # pinned to the first green run (2026-07-29)
           only-new-issues: true
 
   ci-ok:
     name: CI OK
-    # lint chỉ chạy trên pull_request — result "skipped" trên push là hợp lệ;
-    # chỉ fail khi có job failure/cancelled.
+    # lint runs on pull_request only — a "skipped" result on push is fine;
+    # fail only on an actual failure/cancelled job.
     needs: [build, test, lint]
     if: always()
     runs-on: ubuntu-latest

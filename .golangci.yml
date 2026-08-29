@@ -1,8 +1,9 @@
 version: "2"
 
-# Config v2 theo control-plane. Lint chỉ chặn code MỚI trong PR (only-new-issues
-# trong CI), nên bộ linter giữ ở mức chuẩn + vài linter giá trị cao, tránh chặn
-# cả codebase cũ của blockstorage-csi (fork từ cloud-provider-openstack).
+# v2 config following control-plane. Lint only blocks NEW code in PRs
+# (only-new-issues in CI), so the linter set stays standard plus a few
+# high-value ones, without gating the pre-existing blockstorage-csi codebase
+# (forked from cloud-provider-openstack).
 
 linters:
   default: standard
