@@ -1,0 +1,27 @@
+version: "2"
+
+# Config v2 theo control-plane. Lint chỉ chặn code MỚI trong PR (only-new-issues
+# trong CI), nên bộ linter giữ ở mức chuẩn + vài linter giá trị cao, tránh chặn
+# cả codebase cũ của blockstorage-csi (fork từ cloud-provider-openstack).
+
+linters:
+  default: standard
+  enable:
+    - misspell
+    - unconvert
+    - goconst
+    - gocritic
+
+issues:
+  max-issues-per-linter: 0
+
+formatters:
+  enable:
+    - gofmt
+    - gci
+  settings:
+    gci:
+      sections:
+        - standard
+        - default
+        - prefix(github.com/vngcloud/vngcloud-blockstorage-csi-driver)

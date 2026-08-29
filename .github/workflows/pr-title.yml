@@ -1,0 +1,36 @@
+name: PR title
+
+# Enforce Conventional Commits trên PR title. Với squash merge, PR title trở
+# thành commit message trên main — release-please và CHANGELOG phụ thuộc vào
+# việc nó machine-readable.
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  pull-requests: read
+
+jobs:
+  semantic:
+    name: Conventional Commits title
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: amannn/action-semantic-pull-request@v6
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          types: |
+            feat
+            fix
+            docs
+            chore
+            refactor
+            test
+            ci
+            perf
+            style
+            revert
+            build
+          requireScope: false
