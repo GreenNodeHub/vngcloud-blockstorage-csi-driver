@@ -1,84 +1,263 @@
 name: Release PROD - Build & Push Image
 
+# Mot ban release phai co mat o CA HAI region (HCM va HAN). Moi region co URL
+# registry, username va password rieng.
+#
+# Bo cuc: validate -> build MOT LAN -> push song song theo matrix -> chot.
+#
+# Vi sao build mot lan roi day di hai noi, thay vi build lai cho tung region:
+# hai lan `make build-local-images` tao ra hai image khac nhau (timestamp, thu
+# tu layer), nen hai region se chay hai binary khac nhau duoi cung mot tag. Build
+# mot lan rong `docker save` rieng ra artifact dam bao ca hai region nhan dung
+# cung mot noi dung.
+#
+# Them mot region moi = them mot muc trong matrix `region` ben duoi, khong phai
+# copy them ba step.
+
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Tag version to build'
+        description: 'Tag version to build (phai bat dau bang vN.N.N)'
         required: true
-      registry:
-        description: 'Select which registry to build & push to'
+      regions:
+        description: 'Region can day len'
         required: true
         default: 'ALL'
         type: choice
         options:
           - ALL
-          - VCR_REGISTRY
-          - VCR_HAN_REGISTRY
+          - HCM
+          - HAN
+
+env:
+  IMAGE_NAME: vngcloud-blockstorage-csi-driver
+  # Tag cuc bo dung trong luc build, truoc khi gan lai theo tung registry.
+  LOCAL_REF: localhost/release/vngcloud-blockstorage-csi-driver
 
 jobs:
-  build-and-push:
+  validate:
+    name: Validate version
     runs-on: ubuntu-latest
-    environment: production
-
+    timeout-minutes: 5
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-      - name: Set common environment
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Tag anh cung chinh la VERSION nhet vao ldflags:
+      #   Makefile:40  -X k8s.io/component-base/version.gitVersion=$(VERSION)
+      # component-base parse chuoi do bang regex ^v(\d+\.\d+\.\d+) NGAY TRONG
+      # init() cua legacyregistry va panic neu khong khop - truoc ca main(), nen
+      # khong co cach nao bat duoc. Mot ban release go thieu chu "v" se day len
+      # ca hai region mot image crash-loop.
+      - name: Version must start with vN.N.N
         run: |
-          echo "REGISTRY_INPUT=${{ github.event.inputs.registry }}" >> $GITHUB_ENV
-          echo "VERSION=${{ github.event.inputs.version }}" >> $GITHUB_ENV
-      - name: Show build config
+          VERSION='${{ inputs.version }}'
+          echo "Version: ${VERSION}"
+          if ! printf '%s' "${VERSION}" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo "::error::Version '${VERSION}' khong khop ^v[0-9]+\.[0-9]+\.[0-9]+ - binary se panic ngay trong init() cua k8s.io/component-base/metrics/legacyregistry."
+            exit 1
+          fi
+
+      - name: Git tag must exist
         run: |
-          echo "Building version: ${{ inputs.version }}"
-          echo "Target registry: ${{ inputs.registry }}"
-      ###########################
-      # VCR_REGISTRY
-      ###########################
-      - name: Build image for VCR_REGISTRY
-        if: env.REGISTRY_INPUT == 'VCR_REGISTRY' || env.REGISTRY_INPUT == 'ALL'
+          VERSION='${{ inputs.version }}'
+          if ! git rev-parse -q --verify "refs/tags/${VERSION}" >/dev/null; then
+            echo "::error::Khong tim thay git tag '${VERSION}'. Tao tag truoc khi release."
+            exit 1
+          fi
+          echo "Tag ${VERSION} -> $(git rev-parse --short "refs/tags/${VERSION}")"
+
+  build:
+    name: Build image once
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ inputs.version }}
+          fetch-depth: 0
+
+      # REGISTRY phai duoc truyen vao. Makefile mac dinh
+      # REGISTRY ?= vcr.vngcloud.vn/60108-cuongdm3 (namespace ca nhan), de trong
+      # thi image se mang ten do.
+      - name: Build
         env:
-          REGISTRY: ${{ vars.VCR_REGISTRY }}
-          VERSION: ${{ env.VERSION }}
+          REGISTRY: localhost/release
+          VERSION: ${{ inputs.version }}
         run: make build-local-images
 
-      - name: Login to VCR_REGISTRY
-        if: env.REGISTRY_INPUT == 'VCR_REGISTRY' || env.REGISTRY_INPUT == 'ALL'
+      - name: Save image
+        run: |
+          docker image save "${LOCAL_REF}:${{ inputs.version }}" -o image.tar
+          ls -lh image.tar
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-image
+          path: image.tar
+          retention-days: 1
+
+  push:
+    name: Push to ${{ matrix.region.name }}
+    needs: build
+    if: inputs.regions == 'ALL' || inputs.regions == matrix.region.name
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: production
+    strategy:
+      # Mot region hong khong duoc huy region con lai: neu HAN fail thi HCM van
+      # phai chay xong, de con biet chinh xac cai nao thieu ma day bu.
+      fail-fast: false
+      matrix:
+        region:
+          - name: HCM
+            registry_var: VCR_REGISTRY
+            username_secret: VCR_USERNAME
+            password_secret: VCR_PASSWORD
+          - name: HAN
+            registry_var: VCR_HAN_REGISTRY
+            username_secret: VCR_HAN_USERNAME
+            password_secret: VCR_HAN_PASSWORD
+    steps:
+      # Thong bao la phu tro, khong duoc lam hong ban release. Neu thieu secret
+      # thi bo qua chu dung fail - va `release-ok` khong khai environment nen no
+      # chi thay duoc secret cap repo/org, khac voi job push.
+      - name: Check notification config
+        id: tg
+        run: |
+          if [ -n '${{ secrets.TELEGRAM_TOKEN }}' ] && [ -n '${{ secrets.TELEGRAM_TO }}' ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::TELEGRAM_TO / TELEGRAM_TOKEN khong thay o pham vi nay, bo qua thong bao."
+          fi
+
+      - name: Verify region config
+        run: |
+          echo "Region:   ${{ matrix.region.name }}"
+          echo "Registry: ${{ vars[matrix.region.registry_var] }}"
+          if [ -z '${{ vars[matrix.region.registry_var] }}' ]; then
+            echo "::error::Bien ${{ matrix.region.registry_var }} rong o environment 'production'. Dat trong Settings -> Environments."
+            exit 1
+          fi
+          if [ -z '${{ secrets[matrix.region.username_secret] }}' ] || [ -z '${{ secrets[matrix.region.password_secret] }}' ]; then
+            echo "::error::Thieu secret ${{ matrix.region.username_secret }} / ${{ matrix.region.password_secret }} o environment 'production'."
+            exit 1
+          fi
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-image
+
+      - name: Load image
+        run: docker image load -i image.tar
+
+      - name: Login to ${{ matrix.region.name }}
         uses: docker/login-action@v3
         with:
-          registry: ${{ vars.VCR_REGISTRY }}
-          username: ${{ secrets.VCR_USERNAME }}
-          password: ${{ secrets.VCR_PASSWORD }}
+          registry: ${{ vars[matrix.region.registry_var] }}
+          username: ${{ secrets[matrix.region.username_secret] }}
+          password: ${{ secrets[matrix.region.password_secret] }}
 
-      - name: Push image to VCR_REGISTRY
-        if: env.REGISTRY_INPUT == 'VCR_REGISTRY' || env.REGISTRY_INPUT == 'ALL'
+      # TARGET duoc ghep trong shell chu khong trong khoi `env:`: IMAGE_NAME va
+      # LOCAL_REF la env cua workflow nen chac chan co mat duoi dang bien shell,
+      # con viec tham chieu context `env` ben trong chinh mot khoi `env:` thi de
+      # ra chuoi rong ma khong bao loi - luc do se push nham `registry//:version`.
+      - name: Tag and push
         env:
-          REGISTRY: ${{ vars.VCR_REGISTRY }}
-          VERSION: ${{ env.VERSION }}
-        run: make push-local-images
+          REGISTRY: ${{ vars[matrix.region.registry_var] }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          TARGET="${REGISTRY}/${IMAGE_NAME}:${VERSION}"
+          echo "Target: ${TARGET}"
 
-      ###########################
-      # VCR_HAN_REGISTRY
-      ###########################
+          docker image tag "${LOCAL_REF}:${VERSION}" "${TARGET}"
+          docker image push "${TARGET}"
 
-      - name: Build image for VCR_HAN_REGISTRY
-        if: env.REGISTRY_INPUT == 'VCR_HAN_REGISTRY' || env.REGISTRY_INPUT == 'ALL'
-        env:
-          REGISTRY: ${{ vars.VCR_HAN_REGISTRY }}
-          VERSION: ${{ env.VERSION }}
-        run: make build-local-images
+          # RepoDigests chi co sau khi push thanh cong. Neu vi ly do nao do no
+          # rong thi chi bo qua phan ghi summary, dung lam fail ca buoc push da
+          # chay xong.
+          DIGEST=$(docker image inspect "${TARGET}" --format '{{ if .RepoDigests }}{{ index .RepoDigests 0 }}{{ end }}' || true)
+          echo "Pushed: ${TARGET} ${DIGEST:+(${DIGEST})}"
+          {
+            echo "### ${{ matrix.region.name }}"
+            echo ""
+            echo '```'
+            echo "${TARGET}"
+            [ -n "${DIGEST}" ] && echo "${DIGEST}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Login to VCR_HAN_REGISTRY
-        if: env.REGISTRY_INPUT == 'VCR_HAN_REGISTRY' || env.REGISTRY_INPUT == 'ALL'
-        uses: docker/login-action@v3
+      - name: Notify failure
+        if: failure() && steps.tg.outputs.enabled == 'true'
+        uses: appleboy/telegram-action@master
         with:
-          registry: ${{ vars.VCR_HAN_REGISTRY }}
-          username: ${{ secrets.VCR_HAN_USERNAME }}
-          password: ${{ secrets.VCR_HAN_PASSWORD }}
+          to: ${{ secrets.TELEGRAM_TO }}
+          token: ${{ secrets.TELEGRAM_TOKEN }}
+          format: markdown
+          message: |
+            *[PROD] RELEASE FAILED*
+            *Repository*: `${{ github.repository }}`
+            *Region*: `${{ matrix.region.name }}`
+            *Version*: `${{ inputs.version }}`
+            *Author*: `${{ github.actor }}`
+            *Workflow*: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
-      - name: Push image to VCR_HAN_REGISTRY
-        if: env.REGISTRY_INPUT == 'VCR_HAN_REGISTRY' || env.REGISTRY_INPUT == 'ALL'
-        env:
-          REGISTRY: ${{ vars.VCR_HAN_REGISTRY }}
-          VERSION: ${{ env.VERSION }}
-        run: make push-local-images
+  release-ok:
+    # Cong duy nhat de biet ban release da tron ven. Khong co job nay thi mot
+    # lan chay ma moi region deu bi skip van hien ra la mau xanh.
+    name: Release OK
+    needs: push
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # Thong bao la phu tro, khong duoc lam hong ban release. Neu thieu secret
+      # thi bo qua chu dung fail - va `release-ok` khong khai environment nen no
+      # chi thay duoc secret cap repo/org, khac voi job push.
+      - name: Check notification config
+        id: tg
+        run: |
+          if [ -n '${{ secrets.TELEGRAM_TOKEN }}' ] && [ -n '${{ secrets.TELEGRAM_TO }}' ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::TELEGRAM_TO / TELEGRAM_TOKEN khong thay o pham vi nay, bo qua thong bao."
+          fi
+
+      # needs.push.result la ket qua GOP cua ca matrix: `success` khi moi leg
+      # da chay deu thanh cong (leg bi skip vi chon mot region khong lam hong
+      # ket qua nay), `failure` khi co leg hong, `skipped` khi khong leg nao
+      # chay. Job nay fail-closed: bat cu gia tri nao khac success deu chan.
+      - name: Verify every requested region was pushed
+        run: |
+          RESULT='${{ needs.push.result }}'
+          echo "Requested regions: ${{ inputs.regions }}"
+          echo "Push matrix result: ${RESULT}"
+
+          if [ "${RESULT}" != "success" ]; then
+            echo "::error::Ban release CHUA tron ven (ket qua matrix push: ${RESULT}). Xem tung leg de biet region nao thieu, va chay lai dung region do."
+            exit 1
+          fi
+
+          if [ '${{ inputs.regions }}' != 'ALL' ]; then
+            echo "::warning::Chi day len region ${{ inputs.regions }}. Mot ban release day du phai co mat o CA HCM va HAN."
+          fi
+
+      - name: Notify success
+        if: steps.tg.outputs.enabled == 'true'
+        uses: appleboy/telegram-action@master
+        with:
+          to: ${{ secrets.TELEGRAM_TO }}
+          token: ${{ secrets.TELEGRAM_TOKEN }}
+          format: markdown
+          message: |
+            *[PROD] RELEASE OK*
+            *Repository*: `${{ github.repository }}`
+            *Version*: `${{ inputs.version }}`
+            *Regions*: `${{ inputs.regions }}`
+            *Author*: `${{ github.actor }}`
+            *Workflow*: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
