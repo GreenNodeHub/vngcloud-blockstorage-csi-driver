@@ -69,6 +69,41 @@ jobs:
           fi
           echo "Tag ${VERSION} -> $(git rev-parse --short "refs/tags/${VERSION}")"
 
+  plan:
+    # Loc region NGAY TU MATRIX thay vi dat `if:` o cap job.
+    # `matrix` khong nam trong cac context ma GitHub cho phep o
+    # jobs.<id>.if (chi co github / needs / vars / inputs), nen mot dieu kien
+    # nhu `inputs.regions == matrix.region.name` lam ca file khong parse duoc -
+    # GitHub tao mot run that bai khong co job nao, ten hien theo duong dan file.
+    name: Plan regions
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - id: plan
+        env:
+          REGIONS: ${{ inputs.regions }}
+        run: |
+          ALL='[
+            {"name":"HCM","registry_var":"VCR_REGISTRY","username_secret":"VCR_USERNAME","password_secret":"VCR_PASSWORD"},
+            {"name":"HAN","registry_var":"VCR_HAN_REGISTRY","username_secret":"VCR_HAN_USERNAME","password_secret":"VCR_HAN_PASSWORD"}
+          ]'
+          if [ "${REGIONS}" = "ALL" ]; then
+            M=$(printf '%s' "${ALL}" | jq -c '.')
+          else
+            M=$(printf '%s' "${ALL}" | jq -c --arg r "${REGIONS}" 'map(select(.name == $r))')
+          fi
+
+          if [ "$(printf '%s' "${M}" | jq 'length')" -eq 0 ]; then
+            echo "::error::Khong co region nao khop '${REGIONS}'."
+            exit 1
+          fi
+
+          echo "matrix=${M}" >> "$GITHUB_OUTPUT"
+          printf '%s' "${M}" | jq -r '.[].name' | sed 's/^/  se day len: /'
+
   build:
     name: Build image once
     needs: validate
@@ -102,8 +137,7 @@ jobs:
 
   push:
     name: Push to ${{ matrix.region.name }}
-    needs: build
-    if: inputs.regions == 'ALL' || inputs.regions == matrix.region.name
+    needs: [build, plan]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: production
@@ -112,15 +146,7 @@ jobs:
       # phai chay xong, de con biet chinh xac cai nao thieu ma day bu.
       fail-fast: false
       matrix:
-        region:
-          - name: HCM
-            registry_var: VCR_REGISTRY
-            username_secret: VCR_USERNAME
-            password_secret: VCR_PASSWORD
-          - name: HAN
-            registry_var: VCR_HAN_REGISTRY
-            username_secret: VCR_HAN_USERNAME
-            password_secret: VCR_HAN_PASSWORD
+        region: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
       # Thong bao la phu tro, khong duoc lam hong ban release. Neu thieu secret
       # thi bo qua chu dung fail - va `release-ok` khong khai environment nen no

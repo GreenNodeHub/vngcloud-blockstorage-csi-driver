@@ -22,7 +22,21 @@ jobs:
     if: contains(github.event.head_commit.message, '[build]' || contains(github.event.head_commit.message, 'Merge branch'))
     # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
+      # Thong bao la phu tro. Truoc day buoc telegram nam DAU TIEN va khong duoc
+      # bao ve: thieu TELEGRAM_TO/TELEGRAM_TOKEN la job chet ngay tu day, moi
+      # buoc con lai bi skip va khong co anh nao duoc build.
+      - name: Check notification config
+        id: tg
+        run: |
+          if [ -n '${{ secrets.TELEGRAM_TOKEN }}' ] && [ -n '${{ secrets.TELEGRAM_TO }}' ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::TELEGRAM_TO / TELEGRAM_TOKEN chua duoc dat, bo qua thong bao."
+          fi
+
       - name: Send alert that a new commit has been created
+        if: steps.tg.outputs.enabled == 'true'
         uses: appleboy/telegram-action@master
         with:
           to: ${{ secrets.TELEGRAM_TO }}
@@ -73,8 +87,8 @@ jobs:
         run: |
           make build-local-images
       - name: Send alert that the image has been built failed
+        if: failure() && steps.tg.outputs.enabled == 'true'
         uses: appleboy/telegram-action@master
-        if: ${{ failure() }}
         with:
           to: ${{ secrets.TELEGRAM_TO }}
           token: ${{ secrets.TELEGRAM_TOKEN }}
@@ -91,8 +105,8 @@ jobs:
             *See changes*: https://github.com/${{ github.repository }}/commit/${{github.sha}}
             *See workflow*: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
       - name: Send alert that the image has been built success
+        if: success() && steps.tg.outputs.enabled == 'true'
         uses: appleboy/telegram-action@master
-        if: ${{ success() }}
         with:
           to: ${{ secrets.TELEGRAM_TO }}
           token: ${{ secrets.TELEGRAM_TOKEN }}
@@ -118,8 +132,8 @@ jobs:
         run: |
           docker image push ${{ vars.VCR_DEV_REGISTRY }}/vngcloud-blockstorage-csi-driver:${{ steps.tag.outputs.tag }}
       - name: Send alert that the image has been pushed failed
+        if: failure() && steps.tg.outputs.enabled == 'true'
         uses: appleboy/telegram-action@master
-        if: ${{ failure() }}
         with:
           to: ${{ secrets.TELEGRAM_TO }}
           token: ${{ secrets.TELEGRAM_TOKEN }}
@@ -136,8 +150,8 @@ jobs:
             *See changes*: https://github.com/${{ github.repository }}/commit/${{github.sha}}
             *See workflow*: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
       - name: Send alert that the image has been pushed success
+        if: success() && steps.tg.outputs.enabled == 'true'
         uses: appleboy/telegram-action@master
-        if: ${{ success() }}
         with:
           to: ${{ secrets.TELEGRAM_TO }}
           token: ${{ secrets.TELEGRAM_TOKEN }}
