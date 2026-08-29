@@ -48,7 +48,14 @@ RUN apk add --no-cache ca-certificates
 # builder itself is always amd64
 FROM --platform=linux/amd64 ${GOLANG_IMAGE} as builder
 
-ARG GOPROXY=https://goproxy.io,direct
+# proxy.golang.org, Go's upstream default, instead of goproxy.io. This has been
+# running on the dev branch since 656ee9e; goproxy.io also had to be replaced in
+# vngcloud-manage-csi-driver after it broke image builds there.
+#
+# ENV rather than ARG means this can no longer be overridden with
+# --build-arg GOPROXY=... - nothing does today (only VERSION and REGISTRY are
+# passed), but see the PR description if that flexibility is wanted back.
+ENV GOPROXY=https://proxy.golang.org,direct
 ARG TARGETOS
 ARG TARGETARCH
 ARG VERSION
@@ -57,7 +64,7 @@ WORKDIR /build
 COPY Makefile go.mod go.sum ./
 COPY cmd/ cmd/
 COPY pkg/ pkg/
-RUN make build GOOS=${TARGETOS} GOARCH=${TARGETARCH} GOPROXY=${GOPROXY} VERSION=${VERSION}
+RUN make build GOOS="${TARGETOS}" GOARCH="${TARGETARCH}" GOPROXY="${GOPROXY}" VERSION="${VERSION}"
 
 
 ################################################################################
