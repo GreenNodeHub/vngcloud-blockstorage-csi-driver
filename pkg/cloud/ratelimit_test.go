@@ -10,35 +10,37 @@ import (
 	lrate "golang.org/x/time/rate"
 )
 
-// sdkErrWithStatus dung lai dung cach SDK dong goi loi HTTP: defaultErrorResponse
-// gan statusCode vao parameters, roi SdkErrorHandler ep error code thanh
-// PermissionDenied va tra ve CHINH object do.
+// sdkErrWithStatus reproduces exactly how the SDK packages an HTTP error:
+// defaultErrorResponse stores statusCode in the parameters, then
+// SdkErrorHandler forces the error code to PermissionDenied and returns that
+// SAME object.
 func sdkErrWithStatus(pstatus int, pcode lsdkErrs.ErrorCode) lsdkErrs.IError {
 	return new(lsdkErrs.SdkError).
 		WithErrorCode(pcode).
 		WithKVparameters("statusCode", pstatus, "url", "https://vserver/volumes")
 }
 
-// TestIsThrottled: 429 phai phan biet duoc voi 403 du SDK bien ca hai thanh
-// PermissionDenied. Chinh su nhap nhang nay tung lam chan doan sai mot su co
-// cua lb-controller ("permission denied" trong khi that ra la het quota).
+// TestIsThrottled: a 429 must be distinguishable from a 403 even though the
+// SDK flattens both into PermissionDenied. That very ambiguity once
+// misdirected the diagnosis of an lb-controller incident ("permission denied"
+// when the truth was quota exhaustion).
 func TestIsThrottled(t *ltesting.T) {
 	tcs := []struct {
 		name string
 		err  lsdkErrs.IError
 		want bool
 	}{
-		{"429 du error code la PermissionDenied", sdkErrWithStatus(429, lsdkErrs.EcPermissionDenied), true},
-		{"403 that su khong phai throttle", sdkErrWithStatus(403, lsdkErrs.EcPermissionDenied), false},
-		{"500 khong phai throttle", sdkErrWithStatus(500, lsdkErrs.EcUnknownError), false},
-		{"loi khong co statusCode", new(lsdkErrs.SdkError).WithErrorCode(lsdkErrs.EcUnknownError), false},
-		{"khong co loi", nil, false},
+		{"429 despite PermissionDenied error code", sdkErrWithStatus(429, lsdkErrs.EcPermissionDenied), true},
+		{"a real 403 is not throttling", sdkErrWithStatus(403, lsdkErrs.EcPermissionDenied), false},
+		{"500 is not throttling", sdkErrWithStatus(500, lsdkErrs.EcUnknownError), false},
+		{"error without statusCode", new(lsdkErrs.SdkError).WithErrorCode(lsdkErrs.EcUnknownError), false},
+		{"no error", nil, false},
 	}
 
 	for _, tc := range tcs {
 		t.Run(tc.name, func(t *ltesting.T) {
 			if got := isThrottled(tc.err); got != tc.want {
-				t.Fatalf("isThrottled() = %v, muon %v", got, tc.want)
+				t.Fatalf("isThrottled() = %v, want %v", got, tc.want)
 			}
 		})
 	}
@@ -49,7 +51,7 @@ func TestAdaptiveRateLimiterDecreasesOnThrottle(t *ltesting.T) {
 	now := ltime.Unix(0, 0)
 
 	if got := rl.currentQPS(); got != rateLimitMaxQPS {
-		t.Fatalf("QPS ban dau = %v, muon %v", got, rateLimitMaxQPS)
+		t.Fatalf("initial QPS = %v, want %v", got, rateLimitMaxQPS)
 	}
 
 	want := rateLimitMaxQPS
@@ -61,12 +63,12 @@ func TestAdaptiveRateLimiterDecreasesOnThrottle(t *ltesting.T) {
 		}
 
 		if got := rl.currentQPS(); got != want {
-			t.Fatalf("sau %d lan throttle: QPS = %v, muon %v", i+1, got, want)
+			t.Fatalf("after %d throttles: QPS = %v, want %v", i+1, got, want)
 		}
 	}
 
 	if got := rl.currentQPS(); got != rateLimitMinQPS {
-		t.Fatalf("QPS phai dung o san %v, thuc te %v", rateLimitMinQPS, got)
+		t.Fatalf("QPS must stop at the floor %v, got %v", rateLimitMinQPS, got)
 	}
 }
 
@@ -77,48 +79,49 @@ func TestAdaptiveRateLimiterRecoveryIsGatedAndCapped(t *ltesting.T) {
 	rl.onThrottled(now)
 	dropped := rl.currentQPS()
 
-	// Ngay sau khi bi throttle thi khong duoc tang lai.
+	// Immediately after a throttle there must be no recovery yet.
 	rl.onSuccess(now.Add(rateLimitRecoverEvery - ltime.Millisecond))
 	if got := rl.currentQPS(); got != dropped {
-		t.Fatalf("hoi phuc qua som: QPS = %v, muon giu %v", got, dropped)
+		t.Fatalf("recovered too early: QPS = %v, want to hold %v", got, dropped)
 	}
 
-	// Qua cua so yen thi tang dan, va khong bao gio vuot tran.
+	// Past the quiet window it climbs gradually, and never exceeds the ceiling.
 	at := now
 	for i := 0; i < 100; i++ {
 		at = at.Add(rateLimitRecoverEvery)
 		rl.onSuccess(at)
 		if got := rl.currentQPS(); got > rateLimitMaxQPS {
-			t.Fatalf("QPS = %v vuot tran %v", got, rateLimitMaxQPS)
+			t.Fatalf("QPS = %v exceeds the ceiling %v", got, rateLimitMaxQPS)
 		}
 	}
 
 	if got := rl.currentQPS(); got != rateLimitMaxQPS {
-		t.Fatalf("sau khi yen lau, QPS = %v, muon tro lai %v", got, rateLimitMaxQPS)
+		t.Fatalf("after a long quiet spell, QPS = %v, want back at %v", got, rateLimitMaxQPS)
 	}
 }
 
-// TestAdaptiveRateLimiterShedsInsteadOfSleeping khoa tinh chat quan trong nhat:
-// khong bao gio ngu lau trong handler, vi handler dang giu inflight lock.
+// TestAdaptiveRateLimiterShedsInsteadOfSleeping pins the most important
+// property: never sleep for long inside the handler, because the handler is
+// holding the inflight lock.
 func TestAdaptiveRateLimiterShedsInsteadOfSleeping(t *ltesting.T) {
-	// 0.1 QPS, burst 1 => token thu hai phai cho 10 giay, vuot rateLimitMaxWait.
+	// 0.1 QPS, burst 1 => the second token needs a 10s wait, beyond rateLimitMaxWait.
 	rl := &adaptiveRateLimiter{limiter: lrate.NewLimiter(0.1, 1), qps: 0.1}
 
 	if !rl.wait() {
-		t.Fatal("token dau tien phai lay duoc ngay")
+		t.Fatal("the first token must be available immediately")
 	}
 
 	start := ltime.Now()
 	if rl.wait() {
-		t.Fatal("token thu hai phai bi tu choi thay vi cho 10 giay")
+		t.Fatal("the second token must be refused instead of waiting 10s")
 	}
 
 	if elapsed := ltime.Since(start); elapsed > ltime.Second {
-		t.Fatalf("wait() ngu mat %v truoc khi tu choi; phai tra ve ngay", elapsed)
+		t.Fatalf("wait() slept %v before refusing; it must return immediately", elapsed)
 	}
 }
 
-// fakeHTTPClient thay cho lsdkClient.IHttpClient de kiem tra decorator.
+// fakeHTTPClient stands in for lsdkClient.IHttpClient to test the decorator.
 type fakeHTTPClient struct {
 	calls int
 	err   lsdkErrs.IError
@@ -151,15 +154,15 @@ func TestThrottledHTTPClientReactsTo429(t *ltesting.T) {
 
 	before := client.limiter.currentQPS()
 	if _, err := client.DoRequest("https://vserver/volumes", fakeRequest{}); err == nil {
-		t.Fatal("loi cua inner client phai duoc tra nguyen ve tren")
+		t.Fatal("the inner client error must be returned unchanged")
 	}
 
 	if inner.calls != 1 {
-		t.Fatalf("inner duoc goi %d lan, muon 1", inner.calls)
+		t.Fatalf("inner called %d times, want 1", inner.calls)
 	}
 
 	if after := client.limiter.currentQPS(); after >= before {
-		t.Fatalf("gap 429 ma QPS khong giam: truoc %v, sau %v", before, after)
+		t.Fatalf("QPS did not drop on a 429: before %v, after %v", before, after)
 	}
 }
 
@@ -169,33 +172,34 @@ func TestThrottledHTTPClientIgnoresNonThrottleErrors(t *ltesting.T) {
 
 	before := client.limiter.currentQPS()
 	if _, err := client.DoRequest("https://vserver/volumes", fakeRequest{}); err == nil {
-		t.Fatal("loi cua inner client phai duoc tra nguyen ve tren")
+		t.Fatal("the inner client error must be returned unchanged")
 	}
 
 	if after := client.limiter.currentQPS(); after != before {
-		t.Fatalf("403 that su khong duoc lam giam QPS: truoc %v, sau %v", before, after)
+		t.Fatalf("a genuine 403 must not reduce QPS: before %v, after %v", before, after)
 	}
 }
 
-// TestErrClientRateLimitedCarriesAnError khoa lai bug nang nhat cua ban dau:
-// IError khong co WithErrors() thi GetError() tra ve nil, va moi caller kieu
-// `return sdkErr.GetError()` bien mot request bi shed thanh THANH CONG IM LANG.
-// Tren duong DetachVolume dieu do lam external-attacher xoa VolumeAttachment
-// trong khi dia con dinh vao node.
+// TestErrClientRateLimitedCarriesAnError pins the worst bug of the first
+// draft: an IError without WithErrors() has a nil GetError(), and every caller
+// written as `return sdkErr.GetError()` turns a shed request into a SILENT
+// SUCCESS. On the DetachVolume path that makes external-attacher delete the
+// VolumeAttachment while the disk is still attached to the node.
 func TestErrClientRateLimitedCarriesAnError(t *ltesting.T) {
 	err := errClientRateLimited("https://vserver/volumes/vol-1")
 
 	if err.GetError() == nil {
-		t.Fatal("GetError() = nil; caller lam `return sdkErr.GetError()` se bao thanh cong gia")
+		t.Fatal("GetError() = nil; a caller doing `return sdkErr.GetError()` reports false success")
 	}
 
 	if err.GetErrorCode() != ecCsiClientRateLimited {
-		t.Fatalf("error code = %v, muon %v", err.GetErrorCode(), ecCsiClientRateLimited)
+		t.Fatalf("error code = %v, want %v", err.GetErrorCode(), ecCsiClientRateLimited)
 	}
 }
 
-// TestAdaptiveRateLimiterShrinksBurst: chi ha rate ma giu nguyen burst thi mot
-// dot scale-up van duoc nap ca bucket cung luc - dung cai burst gay ra 429.
+// TestAdaptiveRateLimiterShrinksBurst: lowering only the rate while keeping
+// the burst means a scale-up still gets the whole bucket admitted at once -
+// the very burst that caused the 429s.
 func TestAdaptiveRateLimiterShrinksBurst(t *ltesting.T) {
 	rl := newAdaptiveRateLimiter()
 	now := ltime.Unix(0, 0)
@@ -207,33 +211,34 @@ func TestAdaptiveRateLimiterShrinksBurst(t *ltesting.T) {
 
 	after := rl.limiter.Burst()
 	if after >= before {
-		t.Fatalf("burst khong giam theo rate: truoc %d, sau %d", before, after)
+		t.Fatalf("burst did not shrink with the rate: before %d, after %d", before, after)
 	}
 	if after < 1 {
-		t.Fatalf("burst = %d, khong duoc xuong duoi 1", after)
+		t.Fatalf("burst = %d, must not go below 1", after)
 	}
 }
 
-// TestThrottledHTTPClientRecoversAfterNonThrottleErrors: neu chi hoi phuc khi
-// sdkErr == nil thi mot dot 5xx keo dai se ghim limiter o san 1 QPS vo thoi han.
+// TestThrottledHTTPClientRecoversAfterNonThrottleErrors: if recovery only ran
+// on sdkErr == nil, a sustained 5xx spell would pin the limiter at the 1 QPS
+// floor indefinitely.
 func TestThrottledHTTPClientRecoversAfterNonThrottleErrors(t *ltesting.T) {
 	inner := &fakeHTTPClient{err: sdkErrWithStatus(429, lsdkErrs.EcPermissionDenied)}
 	client := &throttledHTTPClient{inner: inner, limiter: newAdaptiveRateLimiter()}
 
 	if _, err := client.DoRequest("https://vserver/volumes", fakeRequest{}); err == nil {
-		t.Fatal("mong doi loi tu inner client")
+		t.Fatal("expected an error from the inner client")
 	}
 	dropped := client.limiter.currentQPS()
 
-	// Doi qua cua so hoi phuc roi tra ve 500 - khong phai 429.
+	// Move past the recovery window, then return a 500 - not a 429.
 	client.limiter.lastAdj = ltime.Now().Add(-2 * rateLimitRecoverEvery)
 	inner.err = sdkErrWithStatus(500, lsdkErrs.EcUnknownError)
 
 	if _, err := client.DoRequest("https://vserver/volumes", fakeRequest{}); err == nil {
-		t.Fatal("mong doi loi tu inner client")
+		t.Fatal("expected an error from the inner client")
 	}
 
 	if got := client.limiter.currentQPS(); got <= dropped {
-		t.Fatalf("500 khong phai throttle nen phai cho hoi phuc: truoc %v, sau %v", dropped, got)
+		t.Fatalf("a 500 is not throttling, recovery must proceed: before %v, after %v", dropped, got)
 	}
 }

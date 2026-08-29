@@ -28,8 +28,8 @@ func NewCloud(iamURL, vserverUrl, clientID, clientSecret string, metadataSvc Met
 		WithIamEndpoint(iamURL).
 		WithVServerEndpoint(vserverUrl)
 
-	// WithHttpClient phai duoc goi TRUOC Configure: Configure chi tu tao http
-	// client khi field con nil (client/client.go).
+	// WithHttpClient must be called BEFORE Configure: Configure only creates an
+	// http client of its own when the field is still nil (client/client.go).
 	cloudClient := lsdkClientV2.NewClient(lctx.TODO()).
 		WithHttpClient(NewThrottledHTTPClient(lctx.TODO())).
 		Configure(clientCfg)
@@ -140,13 +140,15 @@ func (s *cloud) GetVolume(volumeID string) (*lsentity.Volume, lserr.IError) {
 	}, nil
 }
 
-// DeleteVolume xoa volume, cho toi khi no o trang thai xoa duoc roi moi xoa.
+// DeleteVolume deletes the volume, waiting until it reaches a deletable state
+// before issuing the delete.
 //
-// Truoc day ham nay ket luan bang bien sentinel `ierr` sau mot vong
-// `_ = ljwait.ExponentialBackoff(...)`: neu volume khong bao gio ve trang thai
-// CanDelete thi het 10 phut `ierr` van nil va ham bao XOA THANH CONG. Khi do
-// external-provisioner xoa luon PV, con volume o lai IaaS vinh vien - khong con
-// object Kubernetes nao tro toi nua, va van tinh tien.
+// The previous implementation reached its verdict through a sentinel variable
+// after `_ = ljwait.ExponentialBackoff(...)`: if the volume never became
+// CanDelete, then after 10 minutes `ierr` was still nil and the function
+// reported SUCCESS. external-provisioner would then remove the PV while the
+// volume lived on at the IaaS forever - orphaned, still billed, with no
+// Kubernetes object pointing at it.
 func (s *cloud) DeleteVolume(pctx lctx.Context, volID string) lserr.IError {
 	llog.InfoS("[INFO] - DeleteVolume: Start deleting the volume", "volumeId", volID)
 
@@ -160,7 +162,7 @@ func (s *cloud) DeleteVolume(pctx lctx.Context, volID string) lserr.IError {
 		return lserr.ErrVolumeFailedToGet(volID, sdkErr)
 	}
 
-	// Cho volume ve trang thai xoa duoc. ctx la deadline.
+	// Wait for the volume to become deletable. The ctx is the deadline.
 	if !vol.CanDelete() {
 		if err := s.waitVolumeDeletable(pctx, volID); err != nil {
 			return err
@@ -185,10 +187,12 @@ func (s *cloud) DeleteVolume(pctx lctx.Context, volID string) lserr.IError {
 	return nil
 }
 
-// AttachVolume gan volume vao instance va cho toi khi vServer bao da gan xong.
+// AttachVolume attaches the volume to the instance and waits until vServer
+// reports the attachment complete.
 //
-// Bo cuc: doc trang thai -> phat lenh DUNG MOT LAN -> poll read-only, ctx la
-// deadline. Giong DetachVolume ben duoi va giong aws-ebs-csi-driver AttachDisk.
+// Shape: read state -> issue the command EXACTLY ONCE -> read-only poll with
+// the ctx as the deadline. Mirrors DetachVolume below and aws-ebs-csi-driver's
+// AttachDisk.
 func (s *cloud) AttachVolume(pctx lctx.Context, pinstanceId, pvolumeId string) (*lsentity.Volume, lserr.IError) {
 	vol, ierr := s.getVolumeForAttach(pvolumeId)
 	if ierr != nil {
@@ -196,20 +200,42 @@ func (s *cloud) AttachVolume(pctx lctx.Context, pinstanceId, pvolumeId string) (
 	}
 
 	if vol.AttachedTheInstance(pinstanceId) {
-		llog.InfoS("[INFO] - AttachVolume: The volume is already attached", "volumeId", pvolumeId, "instanceId", pinstanceId)
-		return lsentity.NewVolume(vol), nil
+		// Fully attached only when the status is IN-USE too. A retry landing
+		// while the volume is still transitional (VmId set, status ATTACHING/
+		// PROCESSING) must NOT report success yet - ControllerPublishVolume
+		// would hand out a devicePath for a block device that does not exist on
+		// the VM. The attach is already in flight, so skip the mutate and just
+		// wait; the same predicate waitDiskAttached uses.
+		if vol.Status == VolumeInUseStatus {
+			llog.InfoS("[INFO] - AttachVolume: The volume is already attached", "volumeId", pvolumeId, "instanceId", pinstanceId)
+			return lsentity.NewVolume(vol), nil
+		}
+
+		llog.InfoS("[INFO] - AttachVolume: Attach already in flight, waiting",
+			"volumeId", pvolumeId, "instanceId", pinstanceId, "status", vol.Status)
+
+		return s.waitDiskAttached(pctx, pinstanceId, pvolumeId)
 	}
 
-	// Phat lenh attach dung mot lan. Neu ctx het han o buoc poll, CO se goi lai
-	// ca RPC nay va lan do se di vao nhanh "da attach" o tren.
+	// Issue the attach exactly once. If the ctx expires during the poll, the CO
+	// retries the whole RPC and that retry takes the "already attached" fast
+	// path above.
 	llog.InfoS("[INFO] - AttachVolume: Attaching the volume", "volumeId", pvolumeId, "instanceId", pinstanceId)
 	if sdkErr := s.client.VServerGateway().V2().ComputeService().
 		AttachBlockVolume(lsdkComputeV2.NewAttachBlockVolumeRequest(pinstanceId, pvolumeId)); sdkErr != nil {
 		switch sdkErr.GetErrorCode() {
 		case lsdkErrs.EcVServerVolumeAlreadyAttachedThisServer:
-			// Muc tieu da dat.
+			// Goal already reached - fall through to the wait to confirm IN-USE.
 		case lsdkErrs.EcVServerVolumeInProcess:
-			llog.InfoS("[INFO] - AttachVolume: The volume is in process, waiting", "volumeId", pvolumeId)
+			// The IaaS REJECTED the attach because another operation owns the
+			// volume - nothing was queued, so waiting here would poll for an
+			// attach nobody is performing, burning the whole sidecar budget
+			// while holding the inflight lock. Return instead; the CO retries
+			// and the next RPC re-reads state and re-issues.
+			llog.InfoS("[INFO] - AttachVolume: The volume is busy, returning for the CO to retry",
+				"volumeId", pvolumeId, "errorCode", sdkErr.GetStringErrorCode())
+
+			return nil, lserr.ErrVolumeFailedToAttach(pinstanceId, pvolumeId, sdkErr)
 		default:
 			ierr = lserr.ErrVolumeFailedToAttach(pinstanceId, pvolumeId, sdkErr)
 			llog.ErrorS(ierr.GetError(), "[ERROR] - AttachVolume: Failed to attach the volume", ierr.GetListParameters()...)
@@ -221,16 +247,16 @@ func (s *cloud) AttachVolume(pctx lctx.Context, pinstanceId, pvolumeId string) (
 	return s.waitDiskAttached(pctx, pinstanceId, pvolumeId)
 }
 
-// getVolumeForAttach doc trang thai volume truoc khi attach.
+// getVolumeForAttach reads the volume state before attaching.
 //
-// Loi doc PHAI duoc phan biet ro: truoc day moi loi tu GetBlockVolumeById deu bi
-// bao cao la ErrVolumeNotFound, vi dieu kien `sdkErr.IsError(NotFound) || vol == nil`
-// luon dung - SDK tra vol == nil tren MOI loi. Mot cu 429 hay 500 vi the hien ra
-// nhu "volume khong ton tai", vua sai chan doan vua khien caller bo cuoc thay vi
-// thu lai.
+// Read errors MUST be told apart: previously every error from
+// GetBlockVolumeById was reported as ErrVolumeNotFound, because the guard
+// `sdkErr.IsError(NotFound) || vol == nil` was always true - the SDK returns
+// vol == nil on EVERY error. A 429 or a 500 therefore surfaced as "volume does
+// not exist", both misdirecting diagnosis and making the caller give up
+// instead of retrying.
 func (s *cloud) getVolumeForAttach(pvolumeId string) (*lsdkEntity.Volume, lserr.IError) {
-	vol, sdkErr := s.client.VServerGateway().V2().VolumeService().
-		GetBlockVolumeById(lsdkVolumeV2.NewGetBlockVolumeByIdRequest(pvolumeId))
+	vol, sdkErr := s.getVolumeById(pvolumeId)
 	if sdkErr != nil {
 		if sdkErr.IsError(lsdkErrs.EcVServerVolumeNotFound) {
 			ierr := lserr.ErrVolumeNotFound(pvolumeId)
@@ -255,14 +281,14 @@ func (s *cloud) getVolumeForAttach(pvolumeId string) (*lsdkEntity.Volume, lserr.
 	return vol, nil
 }
 
-// DetachVolume go volume khoi instance va cho toi khi vServer bao da roi han.
+// DetachVolume detaches the volume from the instance and waits until vServer
+// reports it fully released.
 //
-// Hop dong: idempotent (CSI spec 5.4). Goi lai tren mot volume da detach phai
-// tra nil, khong duoc tra error - neu khong external-attacher se khong bao gio
-// go duoc finalizer cua VolumeAttachment.
+// Contract: idempotent (CSI spec 5.4). Calling it again on an already-detached
+// volume must return nil, never an error - otherwise external-attacher never
+// gets to remove the VolumeAttachment finalizer.
 func (s *cloud) DetachVolume(pctx lctx.Context, pinstanceId, pvolumeId string) lserr.IError {
-	vol, sdkErr := s.client.VServerGateway().V2().VolumeService().
-		GetBlockVolumeById(lsdkVolumeV2.NewGetBlockVolumeByIdRequest(pvolumeId))
+	vol, sdkErr := s.getVolumeById(pvolumeId)
 	if sdkErr != nil {
 		if sdkErr.IsError(lsdkErrs.EcVServerVolumeNotFound) {
 			llog.InfoS("[INFO] - DetachVolume: The volume no longer exists, treat as detached", "volumeId", pvolumeId)
@@ -287,8 +313,8 @@ func (s *cloud) DetachVolume(pctx lctx.Context, pinstanceId, pvolumeId string) l
 		return lserr.ErrVolumeIsInErrorState(pvolumeId)
 	}
 
-	// Phat lenh detach dung mot lan. Truoc day lenh nay nam trong than vong lap
-	// nen bi phat lai moi 10 giay trong toi da 10 phut.
+	// Issue the detach exactly once. Previously this command sat inside the
+	// poll loop and was re-issued every 10 seconds for up to 10 minutes.
 	llog.InfoS("[INFO] - DetachVolume: Detaching the volume", "volumeId", pvolumeId, "instanceId", pinstanceId)
 	if sdkErr = s.client.VServerGateway().V2().ComputeService().
 		DetachBlockVolume(lsdkComputeV2.NewDetachBlockVolumeRequest(pinstanceId, pvolumeId)); sdkErr != nil {
@@ -299,8 +325,17 @@ func (s *cloud) DetachVolume(pctx lctx.Context, pinstanceId, pvolumeId string) l
 
 			return nil
 		case errSetDetachRetryable.ContainsOne(sdkErr.GetErrorCode()):
-			llog.InfoS("[INFO] - DetachVolume: The volume is busy, waiting", "volumeId", pvolumeId,
-				"errorCode", sdkErr.GetStringErrorCode())
+			// The IaaS REJECTED the detach because another operation owns the
+			// volume - nothing was queued. Falling into the read-only wait here
+			// would poll for a detach nobody is performing: if the busy
+			// operation is not itself a detach, the volume settles back to
+			// attached and the poll burns the whole sidecar budget while
+			// holding the inflight lock. Return instead; the CO retries and
+			// the next RPC re-reads state and re-issues.
+			llog.InfoS("[INFO] - DetachVolume: The volume is busy, returning for the CO to retry",
+				"volumeId", pvolumeId, "errorCode", sdkErr.GetStringErrorCode())
+
+			return lserr.ErrVolumeFailedToDetach(pinstanceId, pvolumeId, sdkErr)
 		default:
 			ierr := lserr.ErrVolumeFailedToDetach(pinstanceId, pvolumeId, sdkErr)
 			llog.ErrorS(ierr.GetError(), "[ERROR] - DetachVolume: Failed to detach the volume", ierr.GetListParameters()...)
@@ -328,7 +363,7 @@ func (s *cloud) ResizeOrModifyDisk(pctx lctx.Context, volumeID string, newSizeBy
 	}
 
 	// Check that we need to modify this volume`
-	needsModification, volumeSize, err := s.validateModifyVolume(pctx, volumeID, newSizeGiB, options)
+	needsModification, volumeSize, err := s.validateModifyVolume(pctx, volume, volumeID, newSizeGiB, options)
 	if err != nil || !needsModification {
 		return volumeSize, err
 	}
@@ -338,8 +373,8 @@ func (s *cloud) ResizeOrModifyDisk(pctx lctx.Context, volumeID string, newSizeBy
 	if sdkErr2 != nil {
 		return 0, sdkErr2.GetError()
 	} else if !same && !volume.IsAttched() {
-		// Volume type dich nam o zone khac => phai migrate truoc khi resize.
-		if ierr := s.migrateVolumeToType(pctx, volumeID, options.VolumeType); ierr != nil {
+		// The target volume type lives in another zone => migrate before resizing.
+		if ierr := s.migrateVolumeToType(pctx, volume, volumeID, options.VolumeType); ierr != nil {
 			return 0, ierr.GetError()
 		}
 	}
@@ -350,30 +385,28 @@ func (s *cloud) ResizeOrModifyDisk(pctx lctx.Context, volumeID string, newSizeBy
 		return 0, sdkErr.GetError()
 	}
 
-	_, err = s.waitVolumeAchieveStatus(pctx, volumeID, volumeArchivedStatus)
+	settled, err := s.waitVolumeAchieveStatus(pctx, volumeID, volumeArchivedStatus)
 	if err != nil {
 		return 0, err
 	}
 
-	// Perform one final check on the volume
-	return s.checkDesiredState(volumeID, newSizeGiB, options)
+	// Perform one final check on the volume the wait just observed - no extra GET.
+	return checkDesiredState(settled, volumeID, newSizeGiB, options)
 }
 
-// migrateVolumeToType chuyen volume sang volume type o zone khac roi cho xong.
+// migrateVolumeToType moves the volume to a volume type in another zone and
+// waits for completion.
 //
-// Bo cuc giong DetachVolume: doc trang thai -> phat lenh DUNG MOT LAN (va chi
-// khi chua co migration nao chay) -> poll read-only voi ctx la deadline.
+// Same shape as DetachVolume: read state -> issue the command EXACTLY ONCE
+// (and only when no migration is already running) -> read-only poll with the
+// ctx as the deadline.
 //
-// Truoc day lenh migrate nam trong than vong lap, va vong do dung
-// NewBackOff(10, 10, true, 30m): voi Revert=true thi lan sleep DAU TIEN la
-// floor((2^9-1)/2) = 255 giay, trong khi csi-resizer chi cho 60 giay.
-func (s *cloud) migrateVolumeToType(pctx lctx.Context, pvolumeId, ptargetType string) lserr.IError {
-	raw, sdkErr := s.getVolumeById(pvolumeId)
-	if sdkErr != nil {
-		return lserr.ErrVolumeFailedToGet(pvolumeId, sdkErr)
-	}
-
-	vol := lsentity.NewVolume(raw)
+// Previously the migrate command sat inside the poll loop, and that loop used
+// NewBackOff(10, 10, true, 30m): with Revert=true the FIRST sleep is
+// floor((2^9-1)/2) = 255 seconds, while csi-resizer only waits 60.
+// The caller passes the volume it already holds - this used to be the third
+// sequential GET of the same object on the modify path.
+func (s *cloud) migrateVolumeToType(pctx lctx.Context, vol *lsentity.Volume, pvolumeId, ptargetType string) lserr.IError {
 	if isMigratedToType(vol, ptargetType) {
 		llog.InfoS("[INFO] - migrateVolumeToType: The volume is already on the target type",
 			"volumeId", pvolumeId, "volumeType", ptargetType)
@@ -415,9 +448,10 @@ func (s *cloud) ModifyVolumeType(pctx lctx.Context, pvolumeId, pvolumeType strin
 	llog.InfoS("[INFO] - ModifyVolumeType: Request accepted, waiting for the volume to settle",
 		"volumeId", pvolumeId, "volumeType", pvolumeType, "size", psize)
 
-	// Truoc day vong cho nay la `_ = ljwait.ExponentialBackoff(...)` roi ket luan
-	// bang bien sentinel `ierr`: het 20 phut ma volume chua ve dung type thi ierr
-	// van nil va ham bao THANH CONG. Gio het gio la tra loi.
+	// This wait used to be `_ = ljwait.ExponentialBackoff(...)` with a sentinel
+	// `ierr` verdict: if the volume never reached the target type within 20
+	// minutes, ierr stayed nil and the function reported SUCCESS. Now a timeout
+	// is returned as an error.
 	return s.waitVolumeMigrated(pctx, pvolumeId, pvolumeType)
 }
 

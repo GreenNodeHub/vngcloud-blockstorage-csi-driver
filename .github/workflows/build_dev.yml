@@ -17,19 +17,20 @@ jobs:
     # The type of runner that the job will run on
     runs-on: ubuntu-latest
     environment:
-      # `develop`, khong phai `development`. Bien VCR_DEV_REGISTRY va hai secret
-      # VCR_DEV_USERNAME/PASSWORD deu nam o environment ten `develop`, giong
-      # quy uoc cua vngcloud-manage-csi-driver. Truoc day workflow tro toi
-      # `development` - mot environment rong - nen REGISTRY ra chuoi rong va
-      # docker build hong voi "invalid reference format".
+      # `develop`, not `development`. The VCR_DEV_REGISTRY variable and the two
+      # VCR_DEV_USERNAME/PASSWORD secrets live in the environment named
+      # `develop`, matching the vngcloud-manage-csi-driver convention. The
+      # workflow used to point at `development` - an empty environment - so
+      # REGISTRY resolved to an empty string and docker build failed with
+      # "invalid reference format".
       name: develop
     # Only trigger the workflow if the commit message contains '[build]'
     if: contains(github.event.head_commit.message, '[build]' || contains(github.event.head_commit.message, 'Merge branch'))
     # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
-      # Thong bao la phu tro. Truoc day buoc telegram nam DAU TIEN va khong duoc
-      # bao ve: thieu TELEGRAM_TO/TELEGRAM_TOKEN la job chet ngay tu day, moi
-      # buoc con lai bi skip va khong co anh nao duoc build.
+      # Notifications are auxiliary. The telegram step used to come FIRST and
+      # unguarded: missing TELEGRAM_TO/TELEGRAM_TOKEN killed the job right
+      # there, every remaining step was skipped and no image was ever built.
       - name: Check notification config
         id: tg
         run: |
@@ -37,7 +38,7 @@ jobs:
             echo "enabled=true" >> "$GITHUB_OUTPUT"
           else
             echo "enabled=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::TELEGRAM_TO / TELEGRAM_TOKEN chua duoc dat, bo qua thong bao."
+            echo "::warning::TELEGRAM_TO / TELEGRAM_TOKEN not set, skipping notifications."
           fi
 
       - name: Send alert that a new commit has been created
@@ -63,38 +64,36 @@ jobs:
         with:
           ref: dev
 
-      # Tag anh cung chinh la VERSION nhet vao ldflags:
+      # The image tag is also the VERSION injected into ldflags:
       #   Makefile:40  -X k8s.io/component-base/version.gitVersion=$(VERSION)
-      # component-base parse chuoi do bang regex ^v(\d+\.\d+\.\d+) ngay trong
-      # init() cua legacyregistry va PANIC neu khong khop - truoc ca main(), nen
-      # khong bat duoc. Tag bat buoc mo dau bang vN.N.N; regex khong neo cuoi nen
-      # hau to tu do.
+      # component-base parses that string with ^v(\d+\.\d+\.\d+) inside the
+      # package init() of legacyregistry and PANICS on a mismatch - before
+      # main(), where nothing can recover. The tag MUST start with vN.N.N; the
+      # regex is not end-anchored, so the suffix is free.
       #
-      # Truoc day tag la "v0.0.0" cung nhac cho MOI ban build dev: khong the biet
-      # mot anh den tu commit nao, va khong the rollback ve ban truoc.
+      # Previously the tag was a hardcoded "v0.0.0" for EVERY dev build: no way
+      # to tell which commit an image came from, no way to roll back.
       - id: tag
         run: echo "tag=v0.0.0-dev-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
-      # Runs a set of commands using the runners shell
+      # REGISTRY must be passed in: the Makefile defaults to
+      # REGISTRY ?= vcr.vngcloud.vn/60108-cuongdm3 (a personal namespace), so
+      # leaving it unset makes the build tag the image there while the push
+      # step pushes to VCR_DEV_REGISTRY - two different paths, and the thing
+      # being pushed was never built.
       #
-      # REGISTRY phai duoc truyen vao: Makefile mac dinh
-      # REGISTRY ?= vcr.vngcloud.vn/60108-cuongdm3 (mot namespace ca nhan), nen
-      # neu bo trong thi buoc build tag anh vao do con buoc push lai day len
-      # VCR_DEV_REGISTRY - hai duong dan khac nhau, va cai duoc push chua tung
-      # duoc build.
-      #
-      # continue-on-error da bo: build hong ma van chay tiep sang push chi lam
-      # buoc push that bai xa hon nguyen nhan that.
-      # Bao loi ro rang thay vi de docker bao "invalid reference format" khi
-      # REGISTRY rong.
+      # continue-on-error removed: a broken build carrying on into the push
+      # only surfaces the failure one step away from its real cause.
+      # Report a clear error instead of letting docker fail with
+      # "invalid reference format" when REGISTRY is empty.
       - name: Verify registry config
         run: |
           if [ -z '${{ vars.VCR_DEV_REGISTRY }}' ]; then
-            echo "::error::Bien VCR_DEV_REGISTRY rong o environment 'develop'. Dat trong Settings -> Environments -> develop."
+            echo "::error::VCR_DEV_REGISTRY is empty in environment 'develop'. Set it in Settings -> Environments -> develop."
             exit 1
           fi
           if [ -z '${{ secrets.VCR_DEV_USERNAME }}' ] || [ -z '${{ secrets.VCR_DEV_PASSWORD }}' ]; then
-            echo "::error::Thieu secret VCR_DEV_USERNAME / VCR_DEV_PASSWORD o environment 'develop'."
+            echo "::error::Missing secret VCR_DEV_USERNAME / VCR_DEV_PASSWORD in environment 'develop'."
             exit 1
           fi
           echo "Registry: ${{ vars.VCR_DEV_REGISTRY }}"

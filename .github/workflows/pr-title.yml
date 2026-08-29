@@ -1,8 +1,8 @@
 name: PR title
 
-# Enforce Conventional Commits trên PR title. Với squash merge, PR title trở
-# thành commit message trên main — release-please và CHANGELOG phụ thuộc vào
-# việc nó machine-readable.
+# Enforce Conventional Commits on the PR title. With squash merge, the PR
+# title becomes the commit message on main — release tooling and the CHANGELOG
+# depend on it being machine-readable.
 
 on:
   pull_request:

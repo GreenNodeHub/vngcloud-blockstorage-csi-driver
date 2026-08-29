@@ -160,11 +160,12 @@ func (h *modifyVolumeRequestHandler) mergeModifyVolumeRequest(r *modifyVolumeReq
 }
 
 func (s *controllerService) executeModifyVolumeRequest(volumeID string, req *modifyVolumeRequest) (int64, error) {
-	// Context nay truoc day duoc tao roi bo di (`_, cancel := ...`), nen
-	// DefaultTimeoutModifyChannel khong co tac dung gi. Gio truyen xuong that.
-	// Khong dung ctx cua caller vi mot request da duoc gop tu nhieu caller
-	// (request coalescing); aws-ebs-csi-driver lam y het trong
-	// executeModifyVolumeRequest, chi khac la ho dat 15s con day la 10 phut.
+	// This context used to be created and thrown away (`_, cancel := ...`), so
+	// DefaultTimeoutModifyChannel had no effect at all. It is now passed down.
+	// The caller's ctx is deliberately not used, because one request here may
+	// have been coalesced from several callers; aws-ebs-csi-driver does exactly
+	// the same in its executeModifyVolumeRequest, except with 15s instead of 10
+	// minutes.
 	ctx, cancel := context.WithTimeout(context.Background(), DefaultTimeoutModifyChannel)
 	defer cancel()
 

@@ -67,8 +67,8 @@ $(BUILD_CMDS): $(SOURCES)
 
 test: unit functional
 
-# Cung phien ban voi CI (.github/workflows/ci.yml). .golangci.yml o day la
-# config format v2 nen KHONG chay duoc bang golangci-lint v1.x.
+# Same version as CI (.github/workflows/ci.yml). The .golangci.yml here is in
+# v2 config format and CANNOT be read by golangci-lint v1.x.
 check: work
 	go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 run ./...
 

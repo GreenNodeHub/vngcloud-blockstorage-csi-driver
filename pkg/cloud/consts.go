@@ -26,34 +26,35 @@ const (
 	waitSnapshotActiveSteps   = 5
 )
 
-// Backoff cho cac thao tac volume phia IaaS. Giong het ban da ap dung cho
-// vngcloud-manage-csi-driver, va hoc tu aws-ebs-csi-driver
+// Backoff for volume operations against the IaaS. Identical to what is already
+// deployed in vngcloud-manage-csi-driver, and modelled on aws-ebs-csi-driver
 // (pkg/cloud/cloud.go, volumeWaitParameters):
 //
-//  1. TANG DAN, bat dau ngan. Attach/detach tren vServer hoan tat trong khoang
-//     giay den vai chuc giay nen lan poll dau tien phai xay ra gan nhu ngay.
+//  1. ASCENDING, starting short. Attach/detach on vServer completes within
+//     seconds to a few tens of seconds, so the first poll must happen almost
+//     immediately.
 //
-//  2. Deadline la ctx cua gRPC, KHONG phai dong ho noi bo. csi-attacher o day
-//     chay --timeout=6m, csi-resizer/volumemodifier 60s; handler phai chet cung
-//     client de nha inflight lock, neu khong moi retry deu an
-//     "Aborted: operation already exists". Steps chi la chan tren.
+//  2. The deadline is the gRPC context, NOT an internal clock. csi-attacher
+//     here runs --timeout=6m, csi-resizer/volumemodifier 60s; the handler must
+//     die with its client to release the inflight lock, otherwise every retry
+//     gets "Aborted: operation already exists". Steps is only an upper bound.
 //
-//  3. Khong phat lai lenh mutate trong vong poll.
+//  3. Never re-issue a mutating call inside the poll loop.
 //
-// KHONG dat truong Cap. Trong apimachinery, Cap khong phai tran ma la dau cham
-// het: delay() gan steps = 0 ngay khi buoc ke tiep vuot Cap, va vong lap cua
-// ExponentialBackoffWithContext la `for backoff.Steps > 0` - dat Cap se lam
-// Steps tro nen vo nghia.
+// Cap is deliberately NOT set. In apimachinery, Cap is not a ceiling but a full
+// stop: delay() sets steps = 0 as soon as the next interval would exceed Cap,
+// and ExponentialBackoffWithContext loops on `for backoff.Steps > 0` - setting
+// Cap silently makes Steps meaningless.
 var (
-	// 1s, 1.6s, 2.56s, 4.1s, 6.55s, 10.49s, ... ; tong 7m47s, 8 lan poll trong
-	// 60 giay dau.
+	// 1s, 1.6s, 2.56s, 4.1s, 6.55s, 10.49s, ...; 7m47s in total, 8 polls within
+	// the first 60 seconds.
 	volumeOperationBackoff = lwait.Backoff{
 		Duration: 1 * ltime.Second,
 		Factor:   1.6,
 		Steps:    13,
 	}
 
-	// Migrate volume sang zone khac la thao tac cap phut nen bat dau tu 2s.
+	// Migrating a volume across zones is a minutes-scale operation, so start at 2s.
 	volumeMigrationBackoff = lwait.Backoff{
 		Duration: 2 * ltime.Second,
 		Factor:   1.6,
@@ -70,34 +71,37 @@ const (
 	SnapshotActiveStatus = "ACTIVE"
 )
 
-// Phan loai loi cua DetachBlockVolume. Danh sach ma API nay tra ve la huu han
-// va do chinh SDK khai bao (services/compute/v2/server.go): VolumeNotFound,
-// VolumeInProcess, ServerNotFound, VolumeIsMigrating, VolumeAvailable. Ma nao
-// khong duoc phan loai se roi vao nhanh default va lam RPC that bai.
+// Error classification for DetachBlockVolume. The set of codes this API can
+// return is finite and declared by the SDK itself
+// (services/compute/v2/server.go): VolumeNotFound, VolumeInProcess,
+// ServerNotFound, VolumeIsMigrating, VolumeAvailable. Any unclassified code
+// falls into the default branch and fails the RPC.
 var (
-	// Muc tieu da dat - khong con gi dinh vao instance nay nua.
-	// ServerNotFound nam o day: node VM da bien mat thi khong the con
-	// attachment, va neu tra loi thi external-attacher se khong bao gio go duoc
-	// finalizer cua VolumeAttachment.
+	// Goal reached - nothing is attached to this instance any more.
+	// ServerNotFound belongs here: once the node VM is gone there can be no
+	// attachment left, and returning an error would mean external-attacher
+	// never gets to remove the VolumeAttachment finalizer.
 	errSetDetachDone = lset.NewSet[lsdkErrs.ErrorCode](
 		lsdkErrs.EcVServerVolumeNotFound,
 		lsdkErrs.EcVServerVolumeAvailable,
 		lsdkErrs.EcVServerServerNotFound,
 	)
 
-	// IaaS dang ban voi mot thao tac khac tren volume nay - xuong poll, dung tra loi.
+	// The IaaS is busy with another operation on this volume - fall through to
+	// the poll instead of returning an error.
 	errSetDetachRetryable = lset.NewSet[lsdkErrs.ErrorCode](
 		lsdkErrs.EcVServerVolumeInProcess,
 		lsdkErrs.EcVServerVolumeIsMigrating,
 	)
 
-	// Cac ma vServer tra ve khi migration da hoac dang chay - phat lenh lan nua
-	// khong sai gi, chi la thua.
+	// Codes vServer returns when a migration has already started or is running -
+	// re-issuing the command is harmless, merely redundant.
 	//
-	// EcVServerVolumeMigrateInSameZone CO Y KHONG nam trong danh sach nay: no
-	// nghia la yeu cau bi TU CHOI vi nguon va dich cung zone, khong co migration
-	// nao chay va se khong bao gio co. Nuot no roi xuong poll se dot het ngan
-	// sach roi that bai bang ErrWaitTimeout, giau mat ly do that.
+	// EcVServerVolumeMigrateInSameZone is DELIBERATELY absent: it means the
+	// request was REJECTED because source and target share a zone - nothing is
+	// running and nothing ever will be. Swallowing it and falling through to
+	// the poll would burn the whole budget and then fail with ErrWaitTimeout,
+	// hiding the real reason.
 	errSetMigrateInProgress = lset.NewSet[lsdkErrs.ErrorCode](
 		lsdkErrs.EcVServerVolumeMigrateBeingProcess,
 		lsdkErrs.EcVServerVolumeMigrateProcessingConfirm,

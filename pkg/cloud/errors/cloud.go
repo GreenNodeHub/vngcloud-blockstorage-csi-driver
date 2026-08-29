@@ -2,6 +2,7 @@ package errors
 
 import (
 	lfmt "fmt"
+
 	lsdkErr "github.com/vngcloud/vngcloud-go-sdk/v2/vngcloud/sdk_error"
 )
 
@@ -14,31 +15,49 @@ var (
 			WithKVparameters("volumeId", pvolId))
 	}
 
+	// psdkErr may be nil: the wait helpers construct these errors from a plain
+	// timeout with no SDK error to wrap. Dereferencing a nil interface here used
+	// to panic the whole controller on every wait timeout.
 	ErrVolumeFailedToDetach = func(pinstanceId, pvolId string, psdkErr lsdkErr.IError) IError {
-		return NewError(new(lsdkErr.SdkError).
+		e := new(lsdkErr.SdkError).
 			WithErrorCode(EcVServerVolumeFailedToDetach).
-			WithErrors(psdkErr.GetError()).
 			WithMessage(lfmt.Sprintf("Failed to detach volume %s from instance %s", pvolId, pinstanceId)).
-			WithKVparameters("instanceId", pinstanceId, "volumeId", pvolId).
-			WithParameters(psdkErr.GetParameters()))
+			WithKVparameters("instanceId", pinstanceId, "volumeId", pvolId)
+		if psdkErr != nil {
+			e = e.WithErrors(psdkErr.GetError()).WithParameters(psdkErr.GetParameters())
+		}
+
+		return NewError(e)
 	}
 
+	// psdkErr may be nil: the wait helpers construct these errors from a plain
+	// timeout with no SDK error to wrap. Dereferencing a nil interface here used
+	// to panic the whole controller on every wait timeout.
 	ErrVolumeFailedToGet = func(pvolId string, psdkErr lsdkErr.IError) IError {
-		return NewError(new(lsdkErr.SdkError).
+		e := new(lsdkErr.SdkError).
 			WithErrorCode(EcVServerVolumeFailedToGet).
-			WithErrors(psdkErr.GetError()).
 			WithMessage(lfmt.Sprintf("Failed to get volume %s", pvolId)).
-			WithKVparameters("volumeId", pvolId).
-			WithParameters(psdkErr.GetParameters()))
+			WithKVparameters("volumeId", pvolId)
+		if psdkErr != nil {
+			e = e.WithErrors(psdkErr.GetError()).WithParameters(psdkErr.GetParameters())
+		}
+
+		return NewError(e)
 	}
 
+	// psdkErr may be nil: the wait helpers construct these errors from a plain
+	// timeout with no SDK error to wrap. Dereferencing a nil interface here used
+	// to panic the whole controller on every wait timeout.
 	ErrVolumeFailedToDelete = func(pvolId string, psdkErr lsdkErr.IError) IError {
-		return NewError(new(lsdkErr.SdkError).
+		e := new(lsdkErr.SdkError).
 			WithErrorCode(EcVServerVolumeFailedToDelete).
-			WithErrors(psdkErr.GetError()).
 			WithMessage(lfmt.Sprintf("Failed to delete volume %s", pvolId)).
-			WithKVparameters("volumeId", pvolId).
-			WithParameters(psdkErr.GetParameters()))
+			WithKVparameters("volumeId", pvolId)
+		if psdkErr != nil {
+			e = e.WithErrors(psdkErr.GetError()).WithParameters(psdkErr.GetParameters())
+		}
+
+		return NewError(e)
 	}
 
 	ErrVolumeNotFound = func(pvolId string) IError {
@@ -48,12 +67,18 @@ var (
 			WithKVparameters("volumeId", pvolId))
 	}
 
+	// psdkErr may be nil: the wait helpers construct these errors from a plain
+	// timeout with no SDK error to wrap. Dereferencing a nil interface here used
+	// to panic the whole controller on every wait timeout.
 	ErrVolumeFailedToAttach = func(pinstanceId, pvolId string, psdkErr lsdkErr.IError) IError {
-		return NewError(new(lsdkErr.SdkError).
+		e := new(lsdkErr.SdkError).
 			WithErrorCode(EcVServerVolumeFailedToAttach).
-			WithErrors(psdkErr.GetError()).
 			WithMessage(lfmt.Sprintf("Failed to attach volume %s to instance %s", pvolId, pinstanceId)).
-			WithKVparameters("instanceId", pinstanceId, "volumeId", pvolId).
-			WithParameters(psdkErr.GetParameters()))
+			WithKVparameters("instanceId", pinstanceId, "volumeId", pvolId)
+		if psdkErr != nil {
+			e = e.WithErrors(psdkErr.GetError()).WithParameters(psdkErr.GetParameters())
+		}
+
+		return NewError(e)
 	}
 )
