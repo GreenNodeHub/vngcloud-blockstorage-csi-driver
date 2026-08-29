@@ -17,7 +17,12 @@ jobs:
     # The type of runner that the job will run on
     runs-on: ubuntu-latest
     environment:
-      name: development  # Set the environment name
+      # `develop`, khong phai `development`. Bien VCR_DEV_REGISTRY va hai secret
+      # VCR_DEV_USERNAME/PASSWORD deu nam o environment ten `develop`, giong
+      # quy uoc cua vngcloud-manage-csi-driver. Truoc day workflow tro toi
+      # `development` - mot environment rong - nen REGISTRY ra chuoi rong va
+      # docker build hong voi "invalid reference format".
+      name: develop
     # Only trigger the workflow if the commit message contains '[build]'
     if: contains(github.event.head_commit.message, '[build]' || contains(github.event.head_commit.message, 'Merge branch'))
     # Steps represent a sequence of tasks that will be executed as part of the job
@@ -80,6 +85,20 @@ jobs:
       #
       # continue-on-error da bo: build hong ma van chay tiep sang push chi lam
       # buoc push that bai xa hon nguyen nhan that.
+      # Bao loi ro rang thay vi de docker bao "invalid reference format" khi
+      # REGISTRY rong.
+      - name: Verify registry config
+        run: |
+          if [ -z '${{ vars.VCR_DEV_REGISTRY }}' ]; then
+            echo "::error::Bien VCR_DEV_REGISTRY rong o environment 'develop'. Dat trong Settings -> Environments -> develop."
+            exit 1
+          fi
+          if [ -z '${{ secrets.VCR_DEV_USERNAME }}' ] || [ -z '${{ secrets.VCR_DEV_PASSWORD }}' ]; then
+            echo "::error::Thieu secret VCR_DEV_USERNAME / VCR_DEV_PASSWORD o environment 'develop'."
+            exit 1
+          fi
+          echo "Registry: ${{ vars.VCR_DEV_REGISTRY }}"
+
       - name: Containerize the application
         env:
           REGISTRY: ${{ vars.VCR_DEV_REGISTRY }}
