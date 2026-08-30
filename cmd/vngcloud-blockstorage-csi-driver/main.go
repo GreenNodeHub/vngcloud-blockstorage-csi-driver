@@ -55,6 +55,7 @@ func main() {
 		lsdriver.WithMode(options.DriverMode),
 		lsdriver.WithOtelTracing(options.ServerOptions.EnableOtelTracing),
 		lsdriver.WithModifyVolumeRequestHandlerTimeout(options.ControllerOptions.ModifyVolumeRequestHandlerTimeout),
+		lsdriver.WithMaxConcurrentVolumeCreates(options.ControllerOptions.MaxConcurrentVolumeCreates),
 		lsdriver.WithClusterID(options.ServerOptions.ClusterID),
 		lsdriver.WithTagKeyLength(options.ServerOptions.TagKeyLength),
 		lsdriver.WithTagValueLength(options.ServerOptions.TagValueLength),
@@ -115,12 +116,13 @@ func (s *ServerOptions) AddFlags(fs *lflag.FlagSet) {
 type ControllerOptions struct {
 	ModifyVolumeRequestHandlerTimeout ltime.Duration
 	UserAgentExtra                    string
+	MaxConcurrentVolumeCreates        int
 }
 
 func (s *ControllerOptions) AddFlags(fs *lflag.FlagSet) {
 	fs.DurationVar(&s.ModifyVolumeRequestHandlerTimeout, "modify-volume-request-handler-timeout", lsdriver.DefaultModifyVolumeRequestHandlerTimeout, "Timeout for the window in which volume modification calls must be received in order for them to coalesce into a single volume modification call to AWS. This must be lower than the csi-resizer and volumemodifier timeouts")
 	fs.StringVar(&s.UserAgentExtra, "user-agent-extra", "", "Extra string appended to user agent.")
-
+	fs.IntVar(&s.MaxConcurrentVolumeCreates, "max-concurrent-volume-creates", lsdriver.DefaultMaxConcurrentVolumeCreates, "The maximum number of CreateVolume operations run against the IaaS at once. vServer degrades under concurrent creates, not request rate; measured optimum is around the default.")
 }
 
 type NodeOptions struct {
