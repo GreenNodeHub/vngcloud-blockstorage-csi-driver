@@ -52,6 +52,7 @@ type DriverOptions struct { // nolint: maligned
 	tagKeyLength                      int
 	tagValueLength                    int
 	maxVolumesPerNode                 int // The maximum number of volumes CAN be attached to each node
+	maxConcurrentVolumeCreates        int // The maximum number of CreateVolume operations run against vServer at once
 }
 
 func NewDriver(options ...func(*DriverOptions)) (*Driver, error) {
@@ -61,6 +62,7 @@ func NewDriver(options ...func(*DriverOptions)) (*Driver, error) {
 		endpoint:                          DefaultCSIEndpoint,
 		mode:                              AllMode,
 		modifyVolumeRequestHandlerTimeout: DefaultModifyVolumeRequestHandlerTimeout,
+		maxConcurrentVolumeCreates:        DefaultMaxConcurrentVolumeCreates,
 	}
 
 	for _, option := range options {
@@ -88,6 +90,14 @@ func NewDriver(options ...func(*DriverOptions)) (*Driver, error) {
 	}
 
 	return &driver, nil
+}
+
+func WithMaxConcurrentVolumeCreates(pn int) func(*DriverOptions) {
+	return func(o *DriverOptions) {
+		if pn > 0 {
+			o.maxConcurrentVolumeCreates = pn
+		}
+	}
 }
 
 func WithEndpoint(endpoint string) func(*DriverOptions) {

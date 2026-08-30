@@ -12,6 +12,12 @@ import (
 const (
 	DefaultCSIEndpoint                       = "unix://tmp/csi.sock"
 	DefaultModifyVolumeRequestHandlerTimeout = 30 * ltime.Second
+
+	// DefaultMaxConcurrentVolumeCreates caps in-flight CreateVolume operations
+	// against vServer. Measured 30/08/2026 (TS-B, 100-PVC storm): 10 concurrent
+	// creates finished 31% faster than 100 with 92% fewer vServer 500s -
+	// vServer chokes on concurrency, not on request rate.
+	DefaultMaxConcurrentVolumeCreates = 10
 	AgentNotReadyNodeTaintKey                = "csi.vngcloud.vn/agent-not-ready"
 
 	DefaultTimeoutModifyChannel = 10 * ltime.Minute
