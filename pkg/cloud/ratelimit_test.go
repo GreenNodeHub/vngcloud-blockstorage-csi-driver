@@ -222,9 +222,10 @@ func TestAdaptiveRateLimiterShrinksBurst(t *ltesting.T) {
 	}
 }
 
-// TestThrottledHTTPClientRecoversAfterNonThrottleErrors: if recovery only ran
-// on sdkErr == nil, a sustained 5xx spell would pin the limiter at the 1 QPS
-// floor indefinitely.
+// TestThrottledHTTPClientRecoversAfterNonThrottleErrors: an error that is
+// neither a 429 nor a 5xx (a 404, a genuine 403) is not a quota or overload
+// signal, so it must not block recovery - otherwise any persistent non-quota
+// failure would pin the limiter low for reasons unrelated to it.
 func TestThrottledHTTPClientRecoversAfterNonThrottleErrors(t *ltesting.T) {
 	inner := &fakeHTTPClient{err: sdkErrWithStatus(429, lsdkErrs.EcPermissionDenied)}
 	client := &throttledHTTPClient{inner: inner, limiter: newAdaptiveRateLimiter()}
@@ -234,16 +235,18 @@ func TestThrottledHTTPClientRecoversAfterNonThrottleErrors(t *ltesting.T) {
 	}
 	dropped := client.limiter.currentQPS()
 
-	// Move past the recovery window, then return a 500 - not a 429.
+	// Move past the recovery window, then return a 404 - neither a 429 nor a
+	// 5xx. A 500 used to stand here, but it now carries its own meaning
+	// (overload, hold the rate); see TestSuccessesDoNotClimbWhileServerErrorsAreRecent.
 	client.limiter.lastAdj = ltime.Now().Add(-2 * rateLimitRecoverEvery)
-	inner.err = sdkErrWithStatus(500, lsdkErrs.EcUnknownError)
+	inner.err = sdkErrWithStatus(404, lsdkErrs.EcUnknownError)
 
 	if _, err := client.DoRequest("https://vserver/volumes", fakeRequest{}); err == nil {
 		t.Fatal("expected an error from the inner client")
 	}
 
 	if got := client.limiter.currentQPS(); got <= dropped {
-		t.Fatalf("a 500 is not throttling, recovery must proceed: before %v, after %v", dropped, got)
+		t.Fatalf("a 404 is neither throttling nor overload, recovery must proceed: before %v, after %v", dropped, got)
 	}
 }
 
@@ -300,5 +303,188 @@ func TestAdaptiveRateLimiterStillReachesFloorUnderSustainedThrottling(t *ltestin
 
 	if got := rl.currentQPS(); got != rateLimitMinQPS {
 		t.Fatalf("after a sustained throttle spell QPS = %v, want the floor %v", got, rateLimitMinQPS)
+	}
+}
+
+// The 5xx policy. The evidence and the reasoning behind it live in one place:
+// the comment block on rateLimitServerErrorDecreaseFactor in ratelimit.go.
+// In short: 5xx tracked load in the TS-B reruns, so it is backpressure - back
+// off mildly (even at the ceiling), do not climb while it continues, but never
+// let it pin the limiter down forever (rateLimitServerErrorHoldMax).
+
+// sdkServerError builds an IError exactly as SDK v2.21.0 does for a 500/503:
+// WithErrorInternalServerError/WithErrorServiceMaintenance assign a dedicated
+// error code (unlike 429, which is flattened into EcPermissionDenied).
+func sdkServerError(pstatus int) lsdkErrs.IError {
+	code := lsdkErrs.EcInternalServerError
+	if pstatus == 503 {
+		code = lsdkErrs.EcServiceMaintenance
+	}
+
+	return sdkErrWithStatus(pstatus, code)
+}
+
+// TestIsServerError pins the classification to the SDK's error codes. The
+// statusCode parameter is NOT usable here: the SDK only stashes it for
+// 401/429/500/503/403, so a `statusCode >= 500` check silently misses
+// everything a gateway mints (502, 504).
+func TestIsServerError(t *ltesting.T) {
+	tcs := []struct {
+		name string
+		err  lsdkErrs.IError
+		want bool
+	}{
+		{"500 carries EcInternalServerError", sdkServerError(500), true},
+		{"503 carries EcServiceMaintenance", sdkServerError(503), true},
+		// The SDK's ErrorHandler also assigns these codes by message pattern on
+		// paths that never stash a statusCode - classification must not depend
+		// on the parameter map.
+		{"5xx code without a statusCode parameter",
+			new(lsdkErrs.SdkError).WithErrorCode(lsdkErrs.EcInternalServerError), true},
+		{"a 429 is throttling, not overload", sdkErrWithStatus(429, lsdkErrs.EcPermissionDenied), false},
+		{"a genuine 403", sdkErrWithStatus(403, lsdkErrs.EcPermissionDenied), false},
+		{"unclassified error", new(lsdkErrs.SdkError).WithErrorCode(lsdkErrs.EcUnknownError), false},
+		{"no error", nil, false},
+	}
+
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *ltesting.T) {
+			if got := isServerError(tc.err); got != tc.want {
+				t.Fatalf("isServerError() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// End-to-end through DoRequest, at the ceiling - the exact state the motivating
+// incident was in (the N=100 rerun had zero 429s, so qps sat at max the whole
+// time). A freeze would be a no-op here; real backpressure must reduce.
+// Because the assertion expects a CHANGE, this test also fails if the switch
+// misroutes the 500 into the onSuccess branch - unlike a hold-steady assertion,
+// which is vacuously true at the ceiling.
+func TestServerErrorBacksOffMildlyThroughDoRequest(t *ltesting.T) {
+	inner := &fakeHTTPClient{err: sdkServerError(500)}
+	client := &throttledHTTPClient{inner: inner, limiter: newAdaptiveRateLimiter()}
+
+	if _, err := client.DoRequest("https://vserver/volumes", fakeRequest{}); err == nil {
+		t.Fatal("the inner client error must be returned unchanged")
+	}
+
+	want := rateLimitMaxQPS * rateLimitServerErrorDecreaseFactor
+	if got := client.limiter.currentQPS(); got != want {
+		t.Fatalf("one 500 through DoRequest left QPS at %v, want a mild decrease to %v", got, want)
+	}
+}
+
+// One 5xx event arrives as a burst, one per in-flight request - same shape as
+// the 429 case, same rule: one event, one decrease.
+func TestServerErrorBurstCountsOnce(t *ltesting.T) {
+	rl := newAdaptiveRateLimiter()
+	now := ltime.Unix(0, 0)
+
+	for i := 0; i < 8; i++ {
+		rl.onServerError(now.Add(ltime.Duration(i) * ltime.Millisecond))
+	}
+
+	want := rateLimitMaxQPS * rateLimitServerErrorDecreaseFactor
+	if got := rl.currentQPS(); got != want {
+		t.Fatalf("a burst of 8 concurrent 500s dropped QPS to %v, want a single step to %v", got, want)
+	}
+}
+
+// Interleaved failures and successes (the N=100 shape: 98 failures scattered
+// through ~370 requests) must not let the successes climb the rate back up
+// while the spell lasts.
+func TestSuccessesDoNotClimbWhileServerErrorsAreRecent(t *ltesting.T) {
+	rl := newAdaptiveRateLimiter()
+	at := ltime.Unix(0, 0)
+
+	// The timeline below assumes each success lands inside the quiet window of
+	// the 5xx before it, and consecutive 5xx keep the spell alive.
+	errToSuccess := rateLimitRecoverEvery // past the recovery gate, so only the 5xx gate can stop the climb
+	if errToSuccess+ltime.Second >= rateLimitServerErrorQuiet {
+		t.Fatalf("timeline broken by retuning: %v + 1s must stay below %v", rateLimitRecoverEvery, rateLimitServerErrorQuiet)
+	}
+
+	rl.onServerError(at)
+	prev := rl.currentQPS()
+
+	// Stay well inside rateLimitServerErrorHoldMax.
+	for i := 0; i < 5; i++ {
+		at = at.Add(ltime.Second)
+		rl.onServerError(at)
+
+		at = at.Add(errToSuccess)
+		rl.onSuccess(at)
+
+		got := rl.currentQPS()
+		if got > prev {
+			t.Fatalf("QPS climbed %v -> %v while 5xx were still arriving", prev, got)
+		}
+		prev = got
+	}
+}
+
+// A sustained pure-5xx storm must keep walking the rate down to the floor,
+// exactly as a 429 storm does - the mild factor only changes the pace.
+func TestSustainedServerErrorsReachTheFloor(t *ltesting.T) {
+	rl := newAdaptiveRateLimiter()
+	at := ltime.Unix(0, 0)
+
+	for i := 0; i < 60; i++ {
+		at = at.Add(rateLimitDecreaseCooldown)
+		rl.onServerError(at)
+	}
+
+	if got := rl.currentQPS(); got != rateLimitMinQPS {
+		t.Fatalf("after a sustained 5xx storm QPS = %v, want the floor %v", got, rateLimitMinQPS)
+	}
+}
+
+// The anti-starvation cap. A single poisoned resource whose GET returns 500
+// forever, polled every few seconds, re-arms the quiet window indefinitely.
+// Without a cap that would pin the process-wide limiter down for the lifetime
+// of the poisoned resource - the exact self-starvation the pre-5xx code
+// existed to prevent. Past rateLimitServerErrorHoldMax the successes must be
+// allowed to climb again, 5xx or not.
+func TestClimbResumesOncePoisonedResourceOutlivesTheHoldCap(t *ltesting.T) {
+	rl := newAdaptiveRateLimiter()
+	at := ltime.Unix(0, 0)
+
+	rl.onServerError(at) // the spell begins
+
+	// The poisoned resource keeps failing every 6s - inside the quiet window,
+	// so the spell never ends - until well past the hold cap.
+	for at.Sub(ltime.Unix(0, 0)) < rateLimitServerErrorHoldMax+rateLimitServerErrorQuiet {
+		at = at.Add(6 * ltime.Second)
+		rl.onServerError(at)
+	}
+
+	// Healthy traffic alongside it: successes past the recovery gate.
+	before := rl.currentQPS()
+	at = at.Add(rateLimitRecoverEvery)
+	rl.onSuccess(at)
+
+	if got := rl.currentQPS(); got <= before {
+		t.Fatalf("QPS = %v after the hold cap expired; want it climbing above %v", got, before)
+	}
+}
+
+func TestRecoveryResumesOnceServerErrorsStop(t *ltesting.T) {
+	rl := newAdaptiveRateLimiter()
+	at := ltime.Unix(0, 0)
+
+	rl.onThrottled(at)
+
+	at = at.Add(ltime.Second)
+	rl.onServerError(at)
+	held := rl.currentQPS()
+
+	// Quiet for longer than the 5xx window, then a success.
+	at = at.Add(rateLimitServerErrorQuiet + rateLimitRecoverEvery)
+	rl.onSuccess(at)
+
+	if got := rl.currentQPS(); got <= held {
+		t.Fatalf("QPS = %v after the 5xx spell ended; want it climbing above %v", got, held)
 	}
 }
