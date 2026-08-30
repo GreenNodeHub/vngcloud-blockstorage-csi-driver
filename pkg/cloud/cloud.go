@@ -50,6 +50,8 @@ func NewCloud(iamURL, vserverUrl, clientID, clientSecret string, metadataSvc Met
 	return &cloud{
 		metadataService: metadataSvc,
 		client:          cloudClient,
+		zonesCache:      newMetaCache[*lsentity.ListZones](metaCacheTTL),
+		volumeTypeCache: newKeyedMetaCache[string](metaCacheTTL),
 	}, nil
 }
 
@@ -57,6 +59,10 @@ type (
 	cloud struct {
 		metadataService MetadataService
 		client          lsdkClientV2.IClient
+
+		// Catalog lookups on the CreateVolume path. See metacache.go.
+		zonesCache      *metaCache[*lsentity.ListZones]
+		volumeTypeCache *keyedMetaCache[string]
 	}
 
 	// ModifyDiskOptions represents parameters to modify a volume
@@ -551,6 +557,12 @@ func (s *cloud) GetVolumeTypeIdByName(zoneId, volumeName string) (string, lserr.
 	volTypeName := strings.ToUpper(parts[0])
 	iopsName := strings.TrimPrefix(parts[1], "iops")
 
+	return s.volumeTypeCache.get(zoneId+"/"+volumeName, func() (string, lserr.IError) {
+		return s.lookupVolumeTypeId(zoneId, volumeName, volTypeName, iopsName)
+	})
+}
+
+func (s *cloud) lookupVolumeTypeId(zoneId, volumeName, volTypeName, iopsName string) (string, lserr.IError) {
 	req := lsdkVolumeV1.NewGetVolumeTypeZonesRequest(zoneId)
 	res, sdkErr := s.client.VServerGateway().V1().VolumeService().GetVolumeTypeZones(req)
 	if sdkErr != nil {
@@ -582,10 +594,12 @@ func (s *cloud) GetVolumeTypeIdByName(zoneId, volumeName string) (string, lserr.
 }
 
 func (s *cloud) GetListZones() (*lsentity.ListZones, lserr.IError) {
-	res, sdkErr := s.client.VServerGateway().V1().PortalService().ListZones()
-	if sdkErr != nil {
-		return nil, lserr.NewError(sdkErr)
-	}
+	return s.zonesCache.get(func() (*lsentity.ListZones, lserr.IError) {
+		res, sdkErr := s.client.VServerGateway().V1().PortalService().ListZones()
+		if sdkErr != nil {
+			return nil, lserr.NewError(sdkErr)
+		}
 
-	return &lsentity.ListZones{ListZones: res}, nil
+		return &lsentity.ListZones{ListZones: res}, nil
+	})
 }
