@@ -11,6 +11,10 @@ on:
   push:
     branches: [ "dev" ]
 
+  # Rebuild the current dev HEAD on demand, without having to invent a commit
+  # whose message carries the magic marker.
+  workflow_dispatch:
+
 # A workflow run is made up of one or more jobs that can run sequentially or in parallel
 jobs:
   deploy-dev:
@@ -24,8 +28,26 @@ jobs:
       # REGISTRY resolved to an empty string and docker build failed with
       # "invalid reference format".
       name: develop
-    # Only trigger the workflow if the commit message contains '[build]'
-    if: contains(github.event.head_commit.message, '[build]' || contains(github.event.head_commit.message, 'Merge branch'))
+    # Build on an explicit [build] marker, on any merge into dev, or on demand.
+    #
+    # The previous condition closed its bracket in the wrong place:
+    #
+    #   contains(msg, '[build]' || contains(msg, 'Merge branch'))
+    #
+    # so the second argument was the expression `'[build]' || contains(...)`.
+    # A non-empty string is truthy and `||` yields the first truthy operand, so
+    # the whole thing collapsed to contains(msg, '[build]') and the merge branch
+    # was dead code - every build_dev run that ever succeeded had [build] in its
+    # message. Merges into dev, the case the author meant to cover, were skipped
+    # silently: a merged PR produced no image and nothing said so.
+    #
+    # 'Merge pull request' is what the GitHub merge button writes; 'Merge
+    # branch' is what a local merge writes. Cover both.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.head_commit.message, '[build]') ||
+      startsWith(github.event.head_commit.message, 'Merge pull request') ||
+      startsWith(github.event.head_commit.message, 'Merge branch')
     # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
       # Notifications are auxiliary. The telegram step used to come FIRST and
