@@ -28,6 +28,7 @@ import (
 type controllerService struct {
 	cloud               lscloud.Cloud
 	inFlight            *lsinternal.InFlight
+	createGate          *lsinternal.Semaphore
 	modifyVolumeManager *modifyVolumeManager
 	driverOptions       *DriverOptions
 	k8sClient           lsk8s.IKubernetes
@@ -66,6 +67,7 @@ func newControllerService(pdriOpts *DriverOptions) controllerService {
 	return controllerService{
 		cloud:               cloudSrv,
 		inFlight:            lsinternal.NewInFlight(),
+		createGate:          lsinternal.NewSemaphore(pdriOpts.maxConcurrentVolumeCreates),
 		driverOptions:       pdriOpts,
 		modifyVolumeManager: newModifyVolumeManager(),
 		k8sClient:           lsk8s.NewKubernetes(k8sClient, recorder),
@@ -125,6 +127,17 @@ func (s *controllerService) CreateVolume(pctx lctx.Context, preq *lcsi.CreateVol
 		llog.InfoS("[INFO] - CreateVolume: Operation completed", "volumeName", volName, "inflightKey", volName)
 		s.inFlight.Delete(volName)
 	}()
+
+	// Cap concurrent creates against vServer (see internal.Semaphore for the
+	// measurements). Waiting is deliberate - a parked goroutine beats retry
+	// churn - and ends with pctx: the sidecar's own timeout cancels it, the CO
+	// retries, and the duplicate is cheaply rejected by the inflight cache
+	// above while this handler still holds the name.
+	if err := s.createGate.Acquire(pctx); err != nil {
+		llog.InfoS("[INFO] - CreateVolume: Context ended while waiting for a create slot", "volumeName", volName)
+		return nil, ErrWaitingForCreateSlot(volName)
+	}
+	defer s.createGate.Release()
 
 	if _, serr = s.cloud.GetVolumeByName(volName); serr != nil {
 		if !serr.IsError(lsdkErrs.EcVServerVolumeNotFound) {
