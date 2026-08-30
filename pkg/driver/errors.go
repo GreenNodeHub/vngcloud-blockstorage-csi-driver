@@ -53,6 +53,10 @@ var (
 )
 
 var (
+	ErrWaitingForCreateSlot = func(pvolumeID string) error {
+		return lstt.Errorf(lcodes.Aborted, "Create volume request for %s is waiting for a free create slot; retry", pvolumeID)
+	}
+
 	ErrVolumeIsCreating = func(pvolumeID string) error {
 		return lstt.Errorf(lcodes.Aborted, "Create volume request for %s is already in progress", pvolumeID)
 	}
