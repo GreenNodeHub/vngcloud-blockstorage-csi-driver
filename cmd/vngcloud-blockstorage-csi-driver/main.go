@@ -55,7 +55,7 @@ func main() {
 		lsdriver.WithMode(options.DriverMode),
 		lsdriver.WithOtelTracing(options.ServerOptions.EnableOtelTracing),
 		lsdriver.WithModifyVolumeRequestHandlerTimeout(options.ControllerOptions.ModifyVolumeRequestHandlerTimeout),
-		lsdriver.WithMaxConcurrentVolumeCreates(options.ControllerOptions.MaxConcurrentVolumeCreates),
+		lsdriver.WithMaxConcurrentVolumeCreates(options.MaxConcurrentVolumeCreates),
 		lsdriver.WithClusterID(options.ServerOptions.ClusterID),
 		lsdriver.WithTagKeyLength(options.ServerOptions.TagKeyLength),
 		lsdriver.WithTagValueLength(options.ServerOptions.TagValueLength),
