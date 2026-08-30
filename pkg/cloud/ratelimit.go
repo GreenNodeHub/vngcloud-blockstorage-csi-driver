@@ -59,11 +59,34 @@ const (
 	rateLimitIncreaseQPS  = 1.0
 	rateLimitRecoverEvery = 5 * ltime.Second
 
-	// How long a 5xx keeps the rate frozen. Long enough to span the gaps
-	// between failures in a burst - during the N=100 run the 500s were mixed in
-	// with successes, so a shorter window would let those successes climb
-	// straight back into the overload.
+	// The 5xx policy, in one place (the tests and DoRequest reference it here).
+	//
+	// Evidence: the TS-B reruns of 29-30/08/2026 on the dev farm. Once the
+	// metadata cache removed all client-side throttling (zero 429s, limiter at
+	// the ceiling the whole run), vServer 500s tracked offered load exactly -
+	// none at N<=25, 16 at N=50, 98 at N=100. Under this driver's own traffic a
+	// 5xx is therefore backpressure, and it needs three properties:
+	//
+	//  1. It must reduce the rate even at the ceiling (a freeze would be a
+	//     no-op there - and the ceiling is exactly where the measured incident
+	//     sat). Milder than the 429 halving, though: a 5xx can also be an
+	//     unrelated service bug, and overreacting to those starves the driver.
+	rateLimitServerErrorDecreaseFactor = 0.9
+
+	//  2. Successes interleaved with the failures (98 failures scattered
+	//     through ~370 requests in the N=100 run) must not climb the rate back
+	//     up while the spell lasts. Recovery stays suspended until this much
+	//     quiet after the last 5xx.
 	rateLimitServerErrorQuiet = 10 * ltime.Second
+
+	//  3. The suspension must not last forever. A single poisoned resource
+	//     whose GET returns 500 indefinitely, polled every few seconds by the
+	//     CO's retry loops, re-arms the quiet window for the lifetime of the
+	//     resource - pinning the process-wide limiter down over one object.
+	//     Past this cap the climb resumes even if 5xx continue; the mild
+	//     per-5xx decrease then balances against recovery instead of the rate
+	//     sticking at the floor.
+	rateLimitServerErrorHoldMax = 90 * ltime.Second
 
 	// Maximum time to wait for a token. Beyond this, fail fast so the CO
 	// retries, instead of sleeping inside the handler - the handler is holding
@@ -81,9 +104,13 @@ type adaptiveRateLimiter struct {
 	qps     float64
 	lastAdj ltime.Time
 
-	// When the service last returned 5xx. Recovery is suspended while this is
-	// recent, so the successes interleaved with the failures cannot climb.
-	lastSrvErr ltime.Time
+	// When the service last returned 5xx, and when the current unbroken spell
+	// of them began. Recovery is suspended while lastSrvErr is recent, so the
+	// successes interleaved with the failures cannot climb - but only until the
+	// spell outlives rateLimitServerErrorHoldMax (see the policy comment on the
+	// constants).
+	lastSrvErr    ltime.Time
+	srvSpellStart ltime.Time
 }
 
 func newAdaptiveRateLimiter() *adaptiveRateLimiter {
@@ -119,13 +146,37 @@ func (s *adaptiveRateLimiter) onThrottled(pnow ltime.Time) {
 	s.setRateLocked(next)
 }
 
-// onServerError: the service is failing, not refusing. Hold the rate where it
-// is - do not climb into an overloaded service, and do not back off either.
+// onServerError: the service is failing under our load (see the policy comment
+// on rateLimitServerErrorDecreaseFactor). Back off mildly - one step per
+// decrease-cooldown window, sharing lastAdj with onThrottled so a 429 and a
+// 5xx from the same burst do not double-punish - and suspend recovery.
 func (s *adaptiveRateLimiter) onServerError(pnow ltime.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// A fresh spell, or a continuation of the current one?
+	if s.lastSrvErr.IsZero() || pnow.Sub(s.lastSrvErr) >= rateLimitServerErrorQuiet {
+		s.srvSpellStart = pnow
+	}
 	s.lastSrvErr = pnow
+
+	if !s.lastAdj.IsZero() && pnow.Sub(s.lastAdj) < rateLimitDecreaseCooldown {
+		return
+	}
+
+	next := s.qps * rateLimitServerErrorDecreaseFactor
+	if next < rateLimitMinQPS {
+		next = rateLimitMinQPS
+	}
+
+	s.lastAdj = pnow
+	if next == s.qps {
+		return
+	}
+
+	llog.InfoS("[WARN] - rateLimiter: vServer returned 5xx, easing off",
+		"fromQPS", s.qps, "toQPS", next)
+	s.setRateLocked(next)
 }
 
 // onSuccess: after rateLimitRecoverEvery of quiet, climb back gradually.
@@ -141,9 +192,13 @@ func (s *adaptiveRateLimiter) onSuccess(pnow ltime.Time) {
 		return
 	}
 
-	// A 5xx spell is not made better by sending more. The successes arriving
-	// between the failures must not be read as room to accelerate.
-	if !s.lastSrvErr.IsZero() && pnow.Sub(s.lastSrvErr) < rateLimitServerErrorQuiet {
+	// A 5xx spell is not made better by sending more: the successes arriving
+	// between the failures must not be read as room to accelerate. Capped,
+	// though - a spell older than the hold cap is a poisoned resource, not an
+	// overload, and must not pin the shared limiter down forever.
+	if !s.lastSrvErr.IsZero() &&
+		pnow.Sub(s.lastSrvErr) < rateLimitServerErrorQuiet &&
+		pnow.Sub(s.srvSpellStart) < rateLimitServerErrorHoldMax {
 		return
 	}
 
@@ -217,21 +272,20 @@ func isThrottled(perr lsdkErrs.IError) bool {
 }
 
 // isServerError reports whether the request failed on the service's side.
-// Same shape as isThrottled: the raw statusCode is only readable here, before
-// the SDK flattens it.
+//
+// Unlike the 429 (flattened into EcPermissionDenied, indistinguishable from a
+// 403 without the raw statusCode), the SDK gives 5xx dedicated error codes
+// that survive to this layer: 500 -> EcInternalServerError, 503 ->
+// EcServiceMaintenance (client/http.go), and ErrorHandler also assigns
+// EcServiceMaintenance by message pattern on paths that carry no statusCode.
+// So classify by code - a `statusCode >= 500` check would silently miss
+// everything a gateway mints (502, 504 never get a statusCode parameter).
+// Transport-level failures (timeouts, connection resets) carry neither a
+// status nor one of these codes and are NOT classified as overload; that is a
+// known gap, acceptable while nothing distinguishes them from a plain 404.
 func isServerError(perr lsdkErrs.IError) bool {
-	if perr == nil {
-		return false
-	}
-
-	code, ok := perr.GetParameters()["statusCode"]
-	if !ok {
-		return false
-	}
-
-	status, ok := code.(int)
-
-	return ok && status >= lhttp.StatusInternalServerError
+	return perr != nil &&
+		perr.IsErrorAny(lsdkErrs.EcInternalServerError, lsdkErrs.EcServiceMaintenance)
 }
 
 // throttledHTTPClient wraps lsdkClient.IHttpClient so that every request goes
@@ -298,20 +352,15 @@ func (s *throttledHTTPClient) DoRequest(purl string, preq lsdkClient.IRequest) (
 			"url", purl, "method", preq.GetRequestMethod())
 
 	case isServerError(sdkErr):
-		// A 5xx is the service failing, not refusing. Hold the rate: climbing
-		// would push harder on something already struggling, and backing off
-		// would starve the driver whenever vServer has trouble unrelated to us.
-		//
-		// The TS-B rerun on 30/08/2026 is what distinguishes the two: the 500s
-		// tracked load exactly - none at N<=25, 16 at N=50, 98 at N=100 - so
-		// under this driver's own traffic they are an overload signal.
+		// Backpressure - see the policy comment on
+		// rateLimitServerErrorDecreaseFactor. Logging happens inside
+		// onServerError, only when the rate actually moves.
 		s.limiter.onServerError(ltime.Now())
-		llog.V(2).InfoS("[DEBUG] - rateLimiter: vServer returned 5xx, holding the rate",
-			"url", purl, "method", preq.GetRequestMethod(), "qps", s.limiter.currentQPS())
 
 	default:
 		// Anything else - a success, a 404, a genuine 403 - is evidence we are
-		// no longer being quota-squeezed.
+		// no longer being quota-squeezed. (Transport-level failures also land
+		// here; see isServerError for why.)
 		s.limiter.onSuccess(ltime.Now())
 	}
 
