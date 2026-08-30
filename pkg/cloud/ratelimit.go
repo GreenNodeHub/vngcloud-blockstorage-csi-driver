@@ -59,6 +59,12 @@ const (
 	rateLimitIncreaseQPS  = 1.0
 	rateLimitRecoverEvery = 5 * ltime.Second
 
+	// How long a 5xx keeps the rate frozen. Long enough to span the gaps
+	// between failures in a burst - during the N=100 run the 500s were mixed in
+	// with successes, so a shorter window would let those successes climb
+	// straight back into the overload.
+	rateLimitServerErrorQuiet = 10 * ltime.Second
+
 	// Maximum time to wait for a token. Beyond this, fail fast so the CO
 	// retries, instead of sleeping inside the handler - the handler is holding
 	// the inflight lock.
@@ -74,6 +80,10 @@ type adaptiveRateLimiter struct {
 	limiter *lrate.Limiter
 	qps     float64
 	lastAdj ltime.Time
+
+	// When the service last returned 5xx. Recovery is suspended while this is
+	// recent, so the successes interleaved with the failures cannot climb.
+	lastSrvErr ltime.Time
 }
 
 func newAdaptiveRateLimiter() *adaptiveRateLimiter {
@@ -109,6 +119,15 @@ func (s *adaptiveRateLimiter) onThrottled(pnow ltime.Time) {
 	s.setRateLocked(next)
 }
 
+// onServerError: the service is failing, not refusing. Hold the rate where it
+// is - do not climb into an overloaded service, and do not back off either.
+func (s *adaptiveRateLimiter) onServerError(pnow ltime.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.lastSrvErr = pnow
+}
+
 // onSuccess: after rateLimitRecoverEvery of quiet, climb back gradually.
 func (s *adaptiveRateLimiter) onSuccess(pnow ltime.Time) {
 	s.mu.Lock()
@@ -119,6 +138,12 @@ func (s *adaptiveRateLimiter) onSuccess(pnow ltime.Time) {
 	}
 
 	if pnow.Sub(s.lastAdj) < rateLimitRecoverEvery {
+		return
+	}
+
+	// A 5xx spell is not made better by sending more. The successes arriving
+	// between the failures must not be read as room to accelerate.
+	if !s.lastSrvErr.IsZero() && pnow.Sub(s.lastSrvErr) < rateLimitServerErrorQuiet {
 		return
 	}
 
@@ -191,6 +216,24 @@ func isThrottled(perr lsdkErrs.IError) bool {
 	return ok && status == lhttp.StatusTooManyRequests
 }
 
+// isServerError reports whether the request failed on the service's side.
+// Same shape as isThrottled: the raw statusCode is only readable here, before
+// the SDK flattens it.
+func isServerError(perr lsdkErrs.IError) bool {
+	if perr == nil {
+		return false
+	}
+
+	code, ok := perr.GetParameters()["statusCode"]
+	if !ok {
+		return false
+	}
+
+	status, ok := code.(int)
+
+	return ok && status >= lhttp.StatusInternalServerError
+}
+
 // throttledHTTPClient wraps lsdkClient.IHttpClient so that every request goes
 // through the shared limiter.
 type throttledHTTPClient struct {
@@ -246,17 +289,29 @@ func (s *throttledHTTPClient) DoRequest(purl string, preq lsdkClient.IRequest) (
 	}
 
 	resp, sdkErr := s.inner.DoRequest(purl, preq)
-	if isThrottled(sdkErr) {
+
+	switch {
+	case isThrottled(sdkErr):
 		s.limiter.onThrottled(ltime.Now())
 		// Record the truth the SDK is about to mask: this is a 429, not a 403.
 		llog.InfoS("[WARN] - rateLimiter: request throttled by vServer (HTTP 429, reported as PermissionDenied)",
 			"url", purl, "method", preq.GetRequestMethod())
-	} else {
-		// Any outcome that is NOT a 429 is evidence we are no longer being
-		// quota-squeezed - including a 500 or a 404. If recovery only ran on
-		// sdkErr == nil, a sustained 5xx spell would pin the limiter at the
-		// 1 QPS floor indefinitely, leaving the driver self-starved for a
-		// reason unrelated to quota once the service comes back.
+
+	case isServerError(sdkErr):
+		// A 5xx is the service failing, not refusing. Hold the rate: climbing
+		// would push harder on something already struggling, and backing off
+		// would starve the driver whenever vServer has trouble unrelated to us.
+		//
+		// The TS-B rerun on 30/08/2026 is what distinguishes the two: the 500s
+		// tracked load exactly - none at N<=25, 16 at N=50, 98 at N=100 - so
+		// under this driver's own traffic they are an overload signal.
+		s.limiter.onServerError(ltime.Now())
+		llog.V(2).InfoS("[DEBUG] - rateLimiter: vServer returned 5xx, holding the rate",
+			"url", purl, "method", preq.GetRequestMethod(), "qps", s.limiter.currentQPS())
+
+	default:
+		// Anything else - a success, a 404, a genuine 403 - is evidence we are
+		// no longer being quota-squeezed.
 		s.limiter.onSuccess(ltime.Now())
 	}
 

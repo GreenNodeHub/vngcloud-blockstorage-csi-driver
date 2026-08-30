@@ -234,16 +234,18 @@ func TestThrottledHTTPClientRecoversAfterNonThrottleErrors(t *ltesting.T) {
 	}
 	dropped := client.limiter.currentQPS()
 
-	// Move past the recovery window, then return a 500 - not a 429.
+	// Move past the recovery window, then return a 404 - neither a 429 nor a
+	// 5xx. A 500 used to stand here, but it now carries its own meaning
+	// (overload, hold the rate); see TestSuccessesDoNotClimbWhileServerErrorsAreRecent.
 	client.limiter.lastAdj = ltime.Now().Add(-2 * rateLimitRecoverEvery)
-	inner.err = sdkErrWithStatus(500, lsdkErrs.EcUnknownError)
+	inner.err = sdkErrWithStatus(404, lsdkErrs.EcUnknownError)
 
 	if _, err := client.DoRequest("https://vserver/volumes", fakeRequest{}); err == nil {
 		t.Fatal("expected an error from the inner client")
 	}
 
 	if got := client.limiter.currentQPS(); got <= dropped {
-		t.Fatalf("a 500 is not throttling, recovery must proceed: before %v, after %v", dropped, got)
+		t.Fatalf("a 404 is neither throttling nor overload, recovery must proceed: before %v, after %v", dropped, got)
 	}
 }
 
@@ -300,5 +302,72 @@ func TestAdaptiveRateLimiterStillReachesFloorUnderSustainedThrottling(t *ltestin
 
 	if got := rl.currentQPS(); got != rateLimitMinQPS {
 		t.Fatalf("after a sustained throttle spell QPS = %v, want the floor %v", got, rateLimitMinQPS)
+	}
+}
+
+// The TS-B rerun on 30/08/2026 measured vServer 500s tracking load exactly: none
+// at N<=25, 16 at N=50, 98 at N=100. A 5xx under that pattern is the service
+// saying it is overloaded, so the limiter must stop climbing. It must NOT back
+// off either - a 5xx spell unrelated to quota would then starve the driver at
+// the floor for a reason that has nothing to do with it.
+
+func TestServerErrorsDoNotReduceTheRate(t *ltesting.T) {
+	inner := &fakeHTTPClient{err: sdkErrWithStatus(500, lsdkErrs.EcUnknownError)}
+	client := &throttledHTTPClient{inner: inner, limiter: newAdaptiveRateLimiter()}
+
+	before := client.limiter.currentQPS()
+	if _, err := client.DoRequest("https://vserver/volumes", fakeRequest{}); err == nil {
+		t.Fatal("the inner client error must be returned unchanged")
+	}
+
+	if after := client.limiter.currentQPS(); after != before {
+		t.Fatalf("a 500 changed QPS from %v to %v; it must hold steady", before, after)
+	}
+}
+
+// The subtle one. During the N=100 run the 98 failures were mixed in with ~370
+// requests, most of which succeeded. If each success is still allowed to climb,
+// the freeze is cancelled out by its own neighbours and the driver keeps
+// accelerating into an overloaded service.
+func TestSuccessesDoNotClimbWhileServerErrorsAreRecent(t *ltesting.T) {
+	rl := newAdaptiveRateLimiter()
+	at := ltime.Unix(0, 0)
+
+	// Drop below the ceiling so there is headroom to climb into.
+	rl.onThrottled(at)
+	dropped := rl.currentQPS()
+
+	// The service is failing intermittently: 5xx keep arriving, interleaved
+	// with successes, for a minute. That is the shape the N=100 run had - 98
+	// failures scattered through ~370 requests.
+	for i := 0; i < 10; i++ {
+		at = at.Add(ltime.Second)
+		rl.onServerError(at)
+
+		at = at.Add(rateLimitRecoverEvery)
+		rl.onSuccess(at)
+
+		if got := rl.currentQPS(); got != dropped {
+			t.Fatalf("QPS climbed to %v while 5xx were still arriving; want to hold %v", got, dropped)
+		}
+	}
+}
+
+func TestRecoveryResumesOnceServerErrorsStop(t *ltesting.T) {
+	rl := newAdaptiveRateLimiter()
+	at := ltime.Unix(0, 0)
+
+	rl.onThrottled(at)
+	dropped := rl.currentQPS()
+
+	at = at.Add(ltime.Second)
+	rl.onServerError(at)
+
+	// Quiet for longer than the 5xx window, then a success.
+	at = at.Add(rateLimitServerErrorQuiet + rateLimitRecoverEvery)
+	rl.onSuccess(at)
+
+	if got := rl.currentQPS(); got <= dropped {
+		t.Fatalf("QPS = %v after the 5xx spell ended; want it climbing above %v", got, dropped)
 	}
 }
