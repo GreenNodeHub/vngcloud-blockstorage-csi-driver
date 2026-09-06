@@ -171,3 +171,36 @@ func TestOnDetachSucceededEmitsRecoveredEventWhenPreviouslyStuck(t *ltesting.T) 
 		t.Fatalf("event = %q, want a Normal VolumeDetachRecovered event", got[0])
 	}
 }
+
+// Item 3: a transient failure that never trips the breaker must stay silent on
+// recovery.
+//
+// The busy-volume rejection is a normal occurrence on this driver, so
+// "one failure then success" is the common case, not the interesting one. Each
+// VolumeDetachRecovered event costs a FindPersistentVolumeByHandle - a full
+// unpaginated PersistentVolumes().List() plus a PV GET plus a PVC GET - and
+// pkg/k8s/k8s.go promises that only ever happens at a handful of moments per
+// STUCK volume. An unpaginated LIST once per detach is the load shape that has
+// OOMed tenant apiservers on this fleet.
+func TestOnDetachSucceededNoEventWhenNeverTripped(t *ltesting.T) {
+	const volumeID, nodeID = "vol-transient", "ins-1"
+	svc, events := newDetachTestService(volumeID)
+	key := lsinternal.BreakerKey{VolumeID: volumeID, NodeID: nodeID}
+
+	now := ltime.Unix(0, 0)
+	svc.onDetachFailed(lctx.Background(), volumeID, nodeID, key, now, nonTerminalDetachError())
+
+	select {
+	case msg := <-events:
+		t.Fatalf("a single untripped failure emitted an event: %q", msg)
+	default:
+	}
+
+	svc.onDetachSucceeded(lctx.Background(), volumeID, nodeID, key, now.Add(2*ltime.Second))
+
+	select {
+	case msg := <-events:
+		t.Fatalf("recovery event emitted for a pair that never tripped: %q", msg)
+	default:
+	}
+}
