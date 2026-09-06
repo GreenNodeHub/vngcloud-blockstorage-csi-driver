@@ -2,10 +2,12 @@ package k8s
 
 import (
 	lctx "context"
+	lfmt "fmt"
 	ltesting "testing"
 
 	lcoreV1 "k8s.io/api/core/v1"
 	lmetav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	lruntime "k8s.io/apimachinery/pkg/runtime"
 	lfake "k8s.io/client-go/kubernetes/fake"
 	lk8srecord "k8s.io/client-go/tools/record"
 )
@@ -79,27 +81,76 @@ func TestVolumeEventWarningOnPVOnlyWhenClaimGone(t *ltesting.T) {
 	}
 }
 
+// capturedEvent keeps the object an event was recorded against. FakeRecorder
+// renders events to a string that carries neither the involved object's name
+// nor (for objects built by the fake clientset, whose TypeMeta is empty) its
+// kind, so counting its strings cannot tell a PVC event from a second PV one.
+type capturedEvent struct {
+	object    lruntime.Object
+	eventType string
+	reason    string
+	message   string
+}
+
+type capturingRecorder struct {
+	events []capturedEvent
+}
+
+func (s *capturingRecorder) Event(pobject lruntime.Object, peventType, preason, pmessage string) {
+	s.events = append(s.events, capturedEvent{pobject, peventType, preason, pmessage})
+}
+
+func (s *capturingRecorder) Eventf(pobject lruntime.Object, peventType, preason, pmessageFmt string, pargs ...interface{}) {
+	s.Event(pobject, peventType, preason, lfmt.Sprintf(pmessageFmt, pargs...))
+}
+
+func (s *capturingRecorder) AnnotatedEventf(
+	pobject lruntime.Object, _ map[string]string, peventType, preason, pmessageFmt string, pargs ...interface{},
+) {
+	s.Eventf(pobject, peventType, preason, pmessageFmt, pargs...)
+}
+
+// The PVC half of this feature has exactly one test. Counting two events is
+// not enough: emitting on the PV twice would count the same. Assert what the
+// second event is actually attached to.
 func TestVolumeEventWarningAlsoOnPVCWhenPresent(t *ltesting.T) {
 	claim := &lcoreV1.ObjectReference{Namespace: "app", Name: "data"}
 	client := lfake.NewSimpleClientset(
 		pvWithHandle("pv-a", "vol-aaa", claim),
 		&lcoreV1.PersistentVolumeClaim{ObjectMeta: lmetav1.ObjectMeta{Namespace: "app", Name: "data"}},
 	)
-	rec := lk8srecord.NewFakeRecorder(10)
+	rec := new(capturingRecorder)
 	k := NewKubernetes(client, rec)
 
 	k.VolumeEventWarning(lctx.Background(), "pv-a", "VolumeDetachStalled", "detach paused")
 
-	got := 0
-	for i := 0; i < 2; i++ {
-		select {
-		case <-rec.Events:
-			got++
-		default:
-		}
+	if len(rec.events) != 2 {
+		t.Fatalf("recorded %d events, want 2 (PV and PVC)", len(rec.events))
 	}
-	if got != 2 {
-		t.Fatalf("recorded %d events, want 2 (PV and PVC)", got)
+
+	// The involved object's kind is its Go type here: objects served by the
+	// fake clientset carry no TypeMeta, and a real EventRecorder derives the
+	// reference's Kind from the type the same way.
+	pv, ok := rec.events[0].object.(*lcoreV1.PersistentVolume)
+	if !ok {
+		t.Fatalf("first event involved object = %T, want *v1.PersistentVolume", rec.events[0].object)
+	}
+	if pv.Name != "pv-a" {
+		t.Fatalf("first event involved object name = %q, want %q", pv.Name, "pv-a")
+	}
+
+	pvc, ok := rec.events[1].object.(*lcoreV1.PersistentVolumeClaim)
+	if !ok {
+		t.Fatalf("second event involved object = %T, want *v1.PersistentVolumeClaim", rec.events[1].object)
+	}
+	if pvc.Name != "data" || pvc.Namespace != "app" {
+		t.Fatalf("second event involved object = %s/%s, want app/data", pvc.Namespace, pvc.Name)
+	}
+
+	for i, ev := range rec.events {
+		if ev.eventType != lcoreV1.EventTypeWarning || ev.reason != "VolumeDetachStalled" || ev.message != "detach paused" {
+			t.Fatalf("event %d = %+v, want a Warning/VolumeDetachStalled/\"detach paused\"", i, ev)
+		}
 	}
 }
 

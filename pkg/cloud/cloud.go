@@ -355,9 +355,16 @@ func (s *cloud) DetachVolume(pctx lctx.Context, pinstanceId, pvolumeId string) l
 
 // IsDetachedFrom is read-only: no DetachBlockVolume, one GetVolume.
 //
-// A volume that no longer exists counts as detached, matching errSetDetachDone
-// - once the volume is gone there is nothing left to detach, and reporting an
-// error would keep external-attacher from removing the finalizer.
+// It reports detached in two cases: the volume no longer exists, or the read
+// shows it AVAILABLE or not attached to this instance. A missing volume counts
+// as detached because there is nothing left to detach, and reporting an error
+// would keep external-attacher from removing the finalizer.
+//
+// This is NOT parity with errSetDetachDone, which is a set of codes returned by
+// the detach COMMAND: EcVServerVolumeAvailable is only covered here
+// incidentally, by isDetachedFrom's IsAvailable() check, and
+// EcVServerServerNotFound has no analogue at all because GetVolume cannot
+// return it.
 func (s *cloud) IsDetachedFrom(pctx lctx.Context, pinstanceId, pvolumeId string) (bool, lserr.IError) {
 	vol, ierr := s.getVolumeById(pvolumeId)
 	if ierr != nil {
