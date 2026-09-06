@@ -132,6 +132,19 @@ const (
 	// VolumeAttributePartition represents key for partition config in VolumeContext
 	// this represents the partition number on a device used to mount
 	VolumeAttributePartition = "partition"
+
+	// Gauge: seconds a (volume, node) pair has been failing to detach, measured
+	// from its first failure. This is the alertable one - "stuck > 30m" - and
+	// the direct equivalent of aws-ebs-csi-driver's
+	// ec2_detach_pending_seconds_total. Only the leader emits it, because only
+	// the leader holds breaker state.
+	MetricDetachPendingSeconds = "vcontainer_csi_volume_detach_pending_seconds"
+
+	// Counter: breaker trips and backoff-step increases, by event reason.
+	MetricDetachBreakerTrips = "vcontainer_csi_detach_breaker_trips_total"
+
+	// Counter: every classified IaaS error, by operation and reason.
+	MetricIaaSErrors = "vcontainer_csi_iaas_errors_total"
 )
 
 // Supported access modes

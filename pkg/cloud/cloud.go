@@ -353,6 +353,24 @@ func (s *cloud) DetachVolume(pctx lctx.Context, pinstanceId, pvolumeId string) l
 	return s.waitVolumeDetached(pctx, pinstanceId, pvolumeId)
 }
 
+// IsDetachedFrom is read-only: no DetachBlockVolume, one GetVolume.
+//
+// A volume that no longer exists counts as detached, matching errSetDetachDone
+// - once the volume is gone there is nothing left to detach, and reporting an
+// error would keep external-attacher from removing the finalizer.
+func (s *cloud) IsDetachedFrom(pctx lctx.Context, pinstanceId, pvolumeId string) (bool, lserr.IError) {
+	vol, ierr := s.getVolumeById(pvolumeId)
+	if ierr != nil {
+		if ierr.IsError(lsdkErrs.EcVServerVolumeNotFound) {
+			return true, nil
+		}
+
+		return false, ierr
+	}
+
+	return isDetachedFrom(vol, pinstanceId), nil
+}
+
 func (s *cloud) ResizeOrModifyDisk(pctx lctx.Context, volumeID string, newSizeBytes int64, options *ModifyDiskOptions) (newSize int64, err error) {
 	newSizeGiB := uint64(lsutil.RoundUpGiB(newSizeBytes))
 	volume, sdkErr := s.GetVolume(volumeID)
