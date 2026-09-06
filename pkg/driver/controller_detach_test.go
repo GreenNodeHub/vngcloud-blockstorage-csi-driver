@@ -1,0 +1,168 @@
+package driver
+
+import (
+	lctx "context"
+	lstr "strings"
+	ltesting "testing"
+	ltime "time"
+
+	lsdkErrs "github.com/vngcloud/vngcloud-go-sdk/v2/vngcloud/sdk_error"
+	lcoreV1 "k8s.io/api/core/v1"
+	lmetav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	lfake "k8s.io/client-go/kubernetes/fake"
+	lk8srecord "k8s.io/client-go/tools/record"
+
+	lserr "github.com/vngcloud/vngcloud-blockstorage-csi-driver/pkg/cloud/errors"
+	lsinternal "github.com/vngcloud/vngcloud-blockstorage-csi-driver/pkg/driver/internal"
+	lsk8s "github.com/vngcloud/vngcloud-blockstorage-csi-driver/pkg/k8s"
+)
+
+// These three helpers hold the only genuinely new policy in Task 5: the
+// "event once per escalation, not per retry" dedup rule, the gauge lifecycle,
+// and the Since-before-Success ordering. None of them touch s.cloud, so they
+// are testable today with no Cloud mock - unlike ControllerUnpublishVolume
+// itself, which the spec accepted would stay untested until one exists.
+
+func pvWithHandle(pname, phandle string) *lcoreV1.PersistentVolume {
+	return &lcoreV1.PersistentVolume{
+		ObjectMeta: lmetav1.ObjectMeta{Name: pname},
+		Spec: lcoreV1.PersistentVolumeSpec{
+			PersistentVolumeSource: lcoreV1.PersistentVolumeSource{
+				CSI: &lcoreV1.CSIPersistentVolumeSource{
+					Driver:       "bs.csi.vngcloud.vn",
+					VolumeHandle: phandle,
+				},
+			},
+		},
+	}
+}
+
+// nonTerminalDetachError classifies as ReasonIaaSUnknownError, non-terminal -
+// so repeated failures walk the breaker through its steps instead of tripping
+// on the first call.
+func nonTerminalDetachError() lserr.IError {
+	return lserr.NewError(new(lsdkErrs.SdkError).WithErrorCode(lsdkErrs.EcUnknownError))
+}
+
+func newDetachTestService(pvolumeID string) (*controllerService, chan string) {
+	rec := lk8srecord.NewFakeRecorder(20)
+	client := lfake.NewSimpleClientset(pvWithHandle("pv-a", pvolumeID))
+
+	svc := &controllerService{
+		detachBreaker: lsinternal.NewBreaker(),
+		k8sClient:     lsk8s.NewKubernetes(client, rec),
+	}
+
+	return svc, rec.Events
+}
+
+// Finding 3 / test 1: repeated failures produce an event on the trip and on
+// each step increase, but not on the retries in between (including the
+// retries that pile up after the backoff has held at the cap).
+func TestOnDetachFailedEventsOnlyOnTripAndStepIncrease(t *ltesting.T) {
+	const volumeID, nodeID = "vol-a", "ins-1"
+	svc, events := newDetachTestService(volumeID)
+	key := lsinternal.BreakerKey{VolumeID: volumeID, NodeID: nodeID}
+	ierr := nonTerminalDetachError()
+
+	now := ltime.Unix(0, 0)
+	gotEvents := 0
+	var messages []string
+	for i := 0; i < BreakerFailuresToWalkAllStepsAndPastCap; i++ {
+		svc.onDetachFailed(lctx.Background(), volumeID, nodeID, key, now, ierr)
+		now = now.Add(ltime.Minute)
+
+		select {
+		case msg := <-events:
+			gotEvents++
+			messages = append(messages, msg)
+		default:
+		}
+	}
+
+	// 3 failures to trip (1 event) + 3 step increases (1 event each) = 4.
+	// BreakerSteps has 4 entries, so only 3 transitions (0->1, 1->2, 2->3)
+	// exist before the backoff holds at the cap; further failures at the cap
+	// produce no more events.
+	if gotEvents != 4 {
+		t.Fatalf("got %d events, want 4 (1 trip + 3 step increases); messages=%v", gotEvents, messages)
+	}
+
+	foundReasonAndDuration := false
+	for _, msg := range messages {
+		if lstr.Contains(msg, "VolumeDetachStalled") && lstr.Contains(msg, "IaaSUnknownError") && lstr.Contains(msg, "stuck for") {
+			foundReasonAndDuration = true
+		}
+	}
+	if !foundReasonAndDuration {
+		t.Fatalf("no event named both the reason and the elapsed time; messages=%v", messages)
+	}
+}
+
+// BreakerFailuresToWalkAllStepsAndPastCap: BreakerTripAfter(3) to trip, then
+// one failure per remaining step transition (len(BreakerSteps)-1 = 3) to walk
+// step 0 -> 1 -> 2 -> 3, then a few more once held at the cap to prove those
+// stay silent.
+const BreakerFailuresToWalkAllStepsAndPastCap = 3 + 3 + 5
+
+// Finding 3 / test 2: a pair that was never tracked (no prior Failure call)
+// produces no event on success - guards the wasTracked branch in
+// onDetachSucceeded.
+func TestOnDetachSucceededNoEventWhenNeverTracked(t *ltesting.T) {
+	const volumeID, nodeID = "vol-untracked", "ins-1"
+	svc, events := newDetachTestService(volumeID)
+	key := lsinternal.BreakerKey{VolumeID: volumeID, NodeID: nodeID}
+
+	svc.onDetachSucceeded(lctx.Background(), volumeID, nodeID, key, ltime.Unix(0, 0))
+
+	select {
+	case msg := <-events:
+		t.Fatalf("event emitted for a pair that was never tracked as failing: %q", msg)
+	default:
+	}
+}
+
+// Finding 3 / test 3: a pair that had tripped produces exactly one Normal /
+// VolumeDetachRecovered event on success. This is the test that would fail if
+// Since (which reads whether the pair was tracked) and Success (which clears
+// it) were ever swapped in onDetachSucceeded - swap them and wasTracked is
+// always false, silently losing every recovery event with no other symptom.
+func TestOnDetachSucceededEmitsRecoveredEventWhenPreviouslyStuck(t *ltesting.T) {
+	const volumeID, nodeID = "vol-b", "ins-1"
+	svc, events := newDetachTestService(volumeID)
+	key := lsinternal.BreakerKey{VolumeID: volumeID, NodeID: nodeID}
+	ierr := nonTerminalDetachError()
+
+	now := ltime.Unix(0, 0)
+	for i := 0; i < 3; i++ {
+		svc.onDetachFailed(lctx.Background(), volumeID, nodeID, key, now, ierr)
+		now = now.Add(ltime.Minute)
+	}
+	// Drain the trip event so it does not get mistaken for the recovery one.
+	select {
+	case <-events:
+	default:
+		t.Fatal("expected a trip event before recovery, got none")
+	}
+
+	now = now.Add(30 * ltime.Minute)
+	svc.onDetachSucceeded(lctx.Background(), volumeID, nodeID, key, now)
+
+	var got []string
+	drain := true
+	for drain {
+		select {
+		case msg := <-events:
+			got = append(got, msg)
+		default:
+			drain = false
+		}
+	}
+
+	if len(got) != 1 {
+		t.Fatalf("got %d events on recovery, want exactly 1; messages=%v", len(got), got)
+	}
+	if !lstr.Contains(got[0], "Normal") || !lstr.Contains(got[0], "VolumeDetachRecovered") {
+		t.Fatalf("event = %q, want a Normal VolumeDetachRecovered event", got[0])
+	}
+}

@@ -382,6 +382,7 @@ func (s *controllerService) ControllerUnpublishVolume(pctx lctx.Context, preq *l
 	volumeID := preq.GetVolumeId()
 	nodeID := preq.GetNodeId()
 	key := volumeID + nodeID
+	bkey := lsinternal.BreakerKey{VolumeID: volumeID, NodeID: nodeID}
 
 	if !s.inFlight.Insert(key) {
 		llog.InfoS("[INFO] - ControllerUnpublishVolume: Operation is already in-flight", "volumeID", volumeID, "nodeID", nodeID, "inflightKey", key)
@@ -396,34 +397,56 @@ func (s *controllerService) ControllerUnpublishVolume(pctx lctx.Context, preq *l
 
 	now := ltime.Now()
 
+	// A pair whose backoff has gone untouched for twice the cap is either gone
+	// or was unstuck by something other than a successful call here (a
+	// force-deleted VolumeAttachment, a garbage-collected Machine, a deleted
+	// volume). Left behind, its gauge series would sit frozen at its last
+	// value forever and the "stuck > 30m" alert this feature exists to raise
+	// would fire permanently on a healthy cluster - the alert silencing
+	// itself. Drop both the breaker entry and the gauge for anything that
+	// stale.
+	for _, stale := range s.detachBreaker.EvictStale(now) {
+		lsmetrics.Recorder().DeleteGauge(MetricDetachPendingSeconds, map[string]string{
+			"volume_id": stale.VolumeID, "node_id": stale.NodeID,
+		})
+	}
+
 	// While the breaker is open we stop commanding the IaaS and only read
 	// state. A stuck detach used to cost ~13 vServer calls every 6 minutes for
 	// as long as it stayed stuck (23 hours, ~3,000 calls, in the incident this
 	// guards against), all from a quota bucket shared across the project.
-	if s.detachBreaker.Allow(key, now) == lsinternal.ProbeOnly {
+	if s.detachBreaker.Allow(bkey, now) == lsinternal.ProbeOnly {
 		detached, ierr := s.cloud.IsDetachedFrom(pctx, nodeID, volumeID)
 		if ierr == nil && detached {
-			s.onDetachSucceeded(pctx, volumeID, nodeID, key, now)
+			s.onDetachSucceeded(pctx, volumeID, nodeID, bkey, now)
 
 			return &lcsi.ControllerUnpublishVolumeResponse{}, nil
 		}
 
 		// A failed probe says nothing about whether the IaaS accepts commands,
-		// so it must NOT advance the backoff.
-		llog.InfoS("[INFO] - ControllerUnpublishVolume: detach paused by breaker, still attached",
-			"volumeID", volumeID, "nodeID", nodeID)
+		// so it must NOT advance the backoff. But a probe error and a genuine
+		// "still attached" read must not look the same to an operator: the
+		// former means the driver has lost the ability to observe this pair,
+		// which is itself worth knowing.
+		if ierr != nil {
+			llog.InfoS("[INFO] - ControllerUnpublishVolume: detach paused by breaker, could not confirm state",
+				"volumeID", volumeID, "nodeID", nodeID, "error", ierr.GetError())
+		} else {
+			llog.InfoS("[INFO] - ControllerUnpublishVolume: detach paused by breaker, still attached",
+				"volumeID", volumeID, "nodeID", nodeID)
+		}
 
 		return nil, ErrDetachVolume(volumeID, nodeID)
 	}
 
 	if ierr := s.cloud.DetachVolume(pctx, nodeID, volumeID); ierr != nil {
 		llog.ErrorS(ierr.GetError(), "[ERROR] - ControllerUnpublishVolume: Failed to detach volume from instance", "volumeID", volumeID, "nodeID", nodeID)
-		s.onDetachFailed(pctx, volumeID, nodeID, key, now, ierr)
+		s.onDetachFailed(pctx, volumeID, nodeID, bkey, now, ierr)
 
 		return nil, ErrDetachVolume(volumeID, nodeID)
 	}
 
-	s.onDetachSucceeded(pctx, volumeID, nodeID, key, now)
+	s.onDetachSucceeded(pctx, volumeID, nodeID, bkey, now)
 	llog.InfoS("[INFO] - ControllerUnpublishVolume: Volume detached from instance successfully", "volumeID", volumeID, "nodeID", nodeID)
 
 	return &lcsi.ControllerUnpublishVolumeResponse{}, nil
@@ -433,7 +456,7 @@ func (s *controllerService) ControllerUnpublishVolume(pctx lctx.Context, preq *l
 // escalation rather than once per retry - the incident this guards against
 // would have produced 5 events instead of ~230.
 func (s *controllerService) onDetachFailed(
-	pctx lctx.Context, pvolumeID, pnodeID, pkey string, pnow ltime.Time, pierr lserr.IError,
+	pctx lctx.Context, pvolumeID, pnodeID string, pkey lsinternal.BreakerKey, pnow ltime.Time, pierr lserr.IError,
 ) {
 	cls := lscloud.Classify(pierr)
 	tripped, stepped := s.detachBreaker.Failure(pkey, cls.Terminal, pnow)
@@ -467,7 +490,7 @@ func (s *controllerService) onDetachFailed(
 // onDetachSucceeded clears the breaker, drops the gauge series so nothing
 // keeps alerting, and says so out loud if the pair had been stuck.
 func (s *controllerService) onDetachSucceeded(
-	pctx lctx.Context, pvolumeID, pnodeID, pkey string, pnow ltime.Time,
+	pctx lctx.Context, pvolumeID, pnodeID string, pkey lsinternal.BreakerKey, pnow ltime.Time,
 ) {
 	stuck, wasTracked := s.detachBreaker.Since(pkey, pnow)
 	s.detachBreaker.Success(pkey)
