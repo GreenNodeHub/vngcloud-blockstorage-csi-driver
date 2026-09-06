@@ -6,12 +6,15 @@ import (
 	ltesting "testing"
 	ltime "time"
 
+	lcsi "github.com/container-storage-interface/spec/lib/go/csi"
 	lsdkErrs "github.com/vngcloud/vngcloud-go-sdk/v2/vngcloud/sdk_error"
+	lstt "google.golang.org/grpc/status"
 	lcoreV1 "k8s.io/api/core/v1"
 	lmetav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	lfake "k8s.io/client-go/kubernetes/fake"
 	lk8srecord "k8s.io/client-go/tools/record"
 
+	lscloud "github.com/vngcloud/vngcloud-blockstorage-csi-driver/pkg/cloud"
 	lserr "github.com/vngcloud/vngcloud-blockstorage-csi-driver/pkg/cloud/errors"
 	lsinternal "github.com/vngcloud/vngcloud-blockstorage-csi-driver/pkg/driver/internal"
 	lsk8s "github.com/vngcloud/vngcloud-blockstorage-csi-driver/pkg/k8s"
@@ -202,5 +205,49 @@ func TestOnDetachSucceededNoEventWhenNeverTripped(t *ltesting.T) {
 	case msg := <-events:
 		t.Fatalf("recovery event emitted for a pair that never tripped: %q", msg)
 	default:
+	}
+}
+
+// stillAttachedCloud answers the breaker's read-only probe and nothing else:
+// any real command this handler might issue while paused would panic on the
+// embedded nil interface, which is exactly the regression worth catching.
+type stillAttachedCloud struct {
+	lscloud.Cloud
+}
+
+func (s stillAttachedCloud) IsDetachedFrom(_ lctx.Context, _, _ string) (bool, lserr.IError) {
+	return false, nil
+}
+
+// Item 5: while the breaker is open, the error the CO records must not claim
+// the driver tried to detach. It lands in
+// VolumeAttachment.status.detachError.message.
+func TestControllerUnpublishVolumeReturnsThePausedErrorWhileTripped(t *ltesting.T) {
+	const volumeID, nodeID = "vol-paused", "ins-1"
+	svc, _ := newDetachTestService(volumeID)
+	svc.cloud = stillAttachedCloud{}
+	svc.inFlight = lsinternal.NewInFlight()
+
+	// The handler reads the real clock, so the trip has to be anchored to it:
+	// three failures ending six minutes ago leave the pair inside
+	// BreakerSteps[0].
+	key := lsinternal.BreakerKey{VolumeID: volumeID, NodeID: nodeID}
+	now := ltime.Now().Add(-18 * ltime.Minute)
+	for i := 0; i < 3; i++ {
+		svc.onDetachFailed(lctx.Background(), volumeID, nodeID, key, now, nonTerminalDetachError())
+		now = now.Add(6 * ltime.Minute)
+	}
+	if got := svc.detachBreaker.Allow(key, ltime.Now()); got != lsinternal.ProbeOnly {
+		t.Fatalf("setup: Allow() = %v, want ProbeOnly", got)
+	}
+
+	_, err := svc.ControllerUnpublishVolume(lctx.Background(), &lcsi.ControllerUnpublishVolumeRequest{
+		VolumeId: volumeID, NodeId: nodeID,
+	})
+	if err == nil {
+		t.Fatal("ControllerUnpublishVolume() = nil error while the breaker is open, want the paused error")
+	}
+	if got, want := lstt.Convert(err).Message(), lstt.Convert(ErrDetachVolumePaused(volumeID, nodeID)).Message(); got != want {
+		t.Fatalf("message = %q, want %q", got, want)
 	}
 }

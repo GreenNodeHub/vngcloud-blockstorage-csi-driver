@@ -431,7 +431,7 @@ func (s *controllerService) ControllerUnpublishVolume(pctx lctx.Context, preq *l
 				"volumeID", volumeID, "nodeID", nodeID)
 		}
 
-		return nil, ErrDetachVolume(volumeID, nodeID)
+		return nil, ErrDetachVolumePaused(volumeID, nodeID)
 	}
 
 	if ierr := s.cloud.DetachVolume(pctx, nodeID, volumeID); ierr != nil {

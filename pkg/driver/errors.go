@@ -79,6 +79,23 @@ var (
 		return lstt.Errorf(lcodes.Internal, "CANNOT Detach volume %s from node %s", pvolumeID, pnodeID)
 	}
 
+	// ErrDetachVolumePaused is the return while the detach circuit-breaker is
+	// open. It exists because this string lands in
+	// VolumeAttachment.status.detachError.message - the first place an
+	// operator looks - and ErrDetachVolume's "CANNOT Detach" says the driver
+	// tried and failed, when on this path it deliberately did not try at all.
+	//
+	// codes.Internal deliberately matches ErrDetachVolume: that is the code
+	// this path is known to be retried on, and the driver needs the retries to
+	// keep probing.
+	ErrDetachVolumePaused = func(pvolumeID, pnodeID string) error {
+		return lstt.Errorf(lcodes.Internal,
+			"Detach of volume %s from node %s is PAUSED by the detach circuit-breaker after repeated IaaS failures; "+
+				"no detach command was issued on this call. Volume state is still being probed on every retry and a "+
+				"real attempt resumes when the current backoff step expires",
+			pvolumeID, pnodeID)
+	}
+
 	ErrFailedToGetDevicePath = func(pvolumeID, pnodeID string) error {
 		return lstt.Errorf(lcodes.Internal, "Failed to get device path for volume %s on node %s", pvolumeID, pnodeID)
 	}
