@@ -112,7 +112,7 @@ func TestOnDetachFailedEventsOnlyOnTripAndStepIncrease(t *ltesting.T) {
 const BreakerFailuresToWalkAllStepsAndPastCap = 3 + 3 + 5
 
 // Finding 3 / test 2: a pair that was never tracked (no prior Failure call)
-// produces no event on success - guards the wasTracked branch in
+// produces no event on success - guards the wasTripped branch in
 // onDetachSucceeded.
 func TestOnDetachSucceededNoEventWhenNeverTracked(t *ltesting.T) {
 	const volumeID, nodeID = "vol-untracked", "ins-1"
@@ -130,8 +130,8 @@ func TestOnDetachSucceededNoEventWhenNeverTracked(t *ltesting.T) {
 
 // Finding 3 / test 3: a pair that had tripped produces exactly one Normal /
 // VolumeDetachRecovered event on success. This is the test that would fail if
-// Since (which reads whether the pair was tracked) and Success (which clears
-// it) were ever swapped in onDetachSucceeded - swap them and wasTracked is
+// Since (which reads whether the pair had tripped) and Success (which clears
+// it) were ever swapped in onDetachSucceeded - swap them and wasTripped is
 // always false, silently losing every recovery event with no other symptom.
 func TestOnDetachSucceededEmitsRecoveredEventWhenPreviouslyStuck(t *ltesting.T) {
 	const volumeID, nodeID = "vol-b", "ins-1"

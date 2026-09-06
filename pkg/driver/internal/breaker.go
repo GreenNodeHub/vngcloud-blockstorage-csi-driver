@@ -185,8 +185,8 @@ func (s *Breaker) Success(pkey BreakerKey) {
 // them: an entry exists from failure #1, but the breaker only opens once the
 // count and BreakerTripMinElapsed are both satisfied. Reporting on merely
 // tracked pairs means reporting on every transient failure. The two flags come
-// back together rather than from a separate Tripped() call so the success path
-// still takes this lock exactly once.
+// back together rather than from a separate Tripped() call so that reading them
+// costs the caller no extra acquisition of this lock.
 func (s *Breaker) Since(pkey BreakerKey, pnow ltime.Time) (ltime.Duration, bool, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
