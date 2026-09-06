@@ -17,6 +17,7 @@ var (
 type metricRecorder struct {
 	registry metrics.KubeRegistry
 	metrics  map[string]interface{}
+	mutex    sync.Mutex
 }
 
 // Recorder returns the singleton instance of metricRecorder.
@@ -42,13 +43,14 @@ func (m *metricRecorder) IncreaseCount(name string, labels map[string]string) {
 		return // recorder is not initialized
 	}
 
-	metric, ok := m.metrics[name]
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
 
+	metric, ok := m.metrics[name]
 	if !ok {
 		klog.V(4).InfoS("Metric not found, registering", "name", name, "labels", labels)
 		m.registerCounterVec(name, "ebs_csi_aws_com metric", getLabelNames(labels))
-		m.IncreaseCount(name, labels)
-		return
+		metric = m.metrics[name]
 	}
 
 	metric.(*metrics.CounterVec).With(metrics.Labels(labels)).Inc()
@@ -59,13 +61,15 @@ func (m *metricRecorder) ObserveHistogram(name string, value float64, labels map
 	if m == nil {
 		return // recorder is not initialized
 	}
-	metric, ok := m.metrics[name]
 
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
+	metric, ok := m.metrics[name]
 	if !ok {
 		klog.V(4).InfoS("Metric not found, registering", "name", name, "labels", labels, "buckets", buckets)
 		m.registerHistogramVec(name, "ebs_csi_aws_com metric", getLabelNames(labels), buckets)
-		m.ObserveHistogram(name, value, labels, buckets)
-		return
+		metric = m.metrics[name]
 	}
 
 	metric.(*metrics.HistogramVec).With(metrics.Labels(labels)).Observe(value)
@@ -79,13 +83,14 @@ func (m *metricRecorder) SetGauge(name string, value float64, labels map[string]
 		return // recorder is not initialized
 	}
 
-	metric, ok := m.metrics[name]
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
 
+	metric, ok := m.metrics[name]
 	if !ok {
 		klog.V(4).InfoS("Metric not found, registering", "name", name, "labels", labels)
-		m.registerGaugeVec(name, "ebs_csi_aws_com metric", getLabelNames(labels))
-		m.SetGauge(name, value, labels)
-		return
+		m.registerGaugeVec(name, "seconds a (volume, node) pair has been failing to detach, measured from its first failure", getLabelNames(labels))
+		metric = m.metrics[name]
 	}
 
 	metric.(*metrics.GaugeVec).With(metrics.Labels(labels)).Set(value)
@@ -97,6 +102,9 @@ func (m *metricRecorder) DeleteGauge(name string, labels map[string]string) {
 	if m == nil {
 		return // recorder is not initialized
 	}
+
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
 
 	metric, ok := m.metrics[name]
 	if !ok {

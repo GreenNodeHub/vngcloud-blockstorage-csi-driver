@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	lsync "sync"
 	ltesting "testing"
 
 	ldto "github.com/prometheus/client_model/go"
@@ -40,6 +41,32 @@ func TestSetGaugeIsIdempotentOnRegistration(t *ltesting.T) {
 
 	if got := gaugeValue(t, r, "vcontainer_csi_test_twice", labels); got != 2 {
 		t.Fatalf("gauge = %v, want 2", got)
+	}
+}
+
+// Several goroutines calling SetGauge concurrently for a metric name that
+// does not exist yet must not race on first-use registration and must not
+// panic with AlreadyRegisteredError from a double MustRegister. Run with
+// -race.
+func TestSetGaugeConcurrentFirstUse(t *ltesting.T) {
+	r := InitializeRecorder()
+	const name = "vcontainer_csi_test_concurrent_first_use"
+	const n = 50
+	labels := map[string]string{"volume_id": "vol-1", "node_id": "ins-1"}
+
+	var wg lsync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func(i int) {
+			defer wg.Done()
+			r.SetGauge(name, float64(i), labels)
+		}(i)
+	}
+	wg.Wait()
+
+	got := gaugeValue(t, r, name, labels)
+	if got < 0 || got >= n {
+		t.Fatalf("gauge = %v, want a value written by one of the %d goroutines (in [0, %d))", got, n, n)
 	}
 }
 
