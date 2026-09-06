@@ -374,6 +374,8 @@ func (s *controllerService) ControllerPublishVolume(pctx lctx.Context, preq *lcs
 	}
 
 	llog.V(5).InfoS("[INFO] - ControllerPublishVolume; volume attached to instance successfully", "volumeID", volumeID, "nodeID", nodeID)
+	s.clearDetachStateOnAttach(lsinternal.BreakerKey{VolumeID: volumeID, NodeID: nodeID}, ltime.Now())
+
 	return newControllerPublishVolumeResponse(devicePath), nil
 }
 
@@ -402,20 +404,7 @@ func (s *controllerService) ControllerUnpublishVolume(pctx lctx.Context, preq *l
 	}()
 
 	now := ltime.Now()
-
-	// A pair whose backoff has gone untouched for twice the cap is either gone
-	// or was unstuck by something other than a successful call here (a
-	// force-deleted VolumeAttachment, a garbage-collected Machine, a deleted
-	// volume). Left behind, its gauge series would sit frozen at its last
-	// value forever and the "stuck > 30m" alert this feature exists to raise
-	// would fire permanently on a healthy cluster - the alert silencing
-	// itself. Drop both the breaker entry and the gauge for anything that
-	// stale.
-	for _, stale := range s.detachBreaker.EvictStale(now) {
-		lsmetrics.Recorder().DeleteGauge(MetricDetachPendingSeconds, map[string]string{
-			"volume_id": stale.VolumeID, "node_id": stale.NodeID,
-		})
-	}
+	s.evictStaleDetachState(now)
 
 	// While the breaker is open we stop commanding the IaaS and only read
 	// state. A stuck detach used to cost ~13 vServer calls every 6 minutes for
@@ -456,6 +445,49 @@ func (s *controllerService) ControllerUnpublishVolume(pctx lctx.Context, preq *l
 	llog.InfoS("[INFO] - ControllerUnpublishVolume: Volume detached from instance successfully", "volumeID", volumeID, "nodeID", nodeID)
 
 	return &lcsi.ControllerUnpublishVolumeResponse{}, nil
+}
+
+// evictStaleDetachState drops every breaker entry no traffic has touched for
+// twice the capped step, and clears the gauge series that went with them.
+//
+// A pair whose backoff has gone untouched that long is either gone or was
+// unstuck by something other than a successful ControllerUnpublishVolume (a
+// force-deleted VolumeAttachment, a garbage-collected Machine, a deleted
+// volume). Left behind, its gauge series would sit frozen at its last value
+// forever and the "stuck > 30m" alert this feature exists to raise would fire
+// permanently on a healthy cluster - the alert silencing itself.
+func (s *controllerService) evictStaleDetachState(pnow ltime.Time) {
+	for _, stale := range s.detachBreaker.EvictStale(pnow) {
+		lsmetrics.Recorder().DeleteGauge(MetricDetachPendingSeconds, map[string]string{
+			"volume_id": stale.VolumeID, "node_id": stale.NodeID,
+		})
+	}
+}
+
+// clearDetachStateOnAttach voids this pair's detach state after a successful
+// attach, and sweeps everything else that has gone stale while it was at it.
+//
+// A fresh successful attach proves any prior detach state void: whatever the
+// breaker still believed about this pair, the volume is demonstrably attached
+// now, so the next detach must get a real attempt rather than starting inside
+// a leftover pause of up to two hours - a pause its probes could never clear,
+// because the volume genuinely IS attached again.
+//
+// Running the sweep here too matters because ControllerUnpublishVolume was the
+// only thing driving it, which makes the leak's own trigger condition (this
+// pair stops receiving unpublish calls) also the thing that stops the sweep.
+//
+// This is NOT an attach-path breaker: the spec forbids gating attach, and
+// nothing here can block or delay one. It only clears state. Both handlers
+// take the same volumeID+nodeID inflight key, so an attach and a detach for
+// one pair cannot interleave and this cannot race the detach bookkeeping.
+func (s *controllerService) clearDetachStateOnAttach(pkey lsinternal.BreakerKey, pnow ltime.Time) {
+	s.evictStaleDetachState(pnow)
+
+	s.detachBreaker.Success(pkey)
+	lsmetrics.Recorder().DeleteGauge(MetricDetachPendingSeconds, map[string]string{
+		"volume_id": pkey.VolumeID, "node_id": pkey.NodeID,
+	})
 }
 
 // onDetachFailed records a real failed attempt, and reports it once per
