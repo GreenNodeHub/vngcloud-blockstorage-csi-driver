@@ -15,15 +15,33 @@ import (
 // driver held open while polling, so the attacher's own exponential backoff
 // never engaged.
 //
-// After BreakerTripAfter real failures for one (volume, node) pair the handler
-// stops sending commands and only probes state, spacing real attempts out along
-// BreakerSteps. It never gives up: every step expiry grants one more real
-// attempt, so the pair still recovers on its own once the IaaS does.
+// After BreakerTripAfter real failures spanning at least BreakerTripMinElapsed
+// for one (volume, node) pair - or one terminal failure, which bypasses that
+// floor - the handler stops sending commands and only probes state, spacing
+// real attempts out along BreakerSteps. It never gives up: every step expiry
+// grants one more real attempt, so the pair still recovers on its own once the
+// IaaS does.
 //
 // State is in-memory and dies with the process. That is deliberate - in the
 // incident above, a controller restart was what finally cleared the volume, so
 // a fresh leader must be allowed to try for real immediately.
 const BreakerTripAfter = 3
+
+// BreakerTripMinElapsed is the elapsed-time floor on the trip: three failures
+// must also span at least this long before the breaker opens.
+//
+// The spec justified BreakerTripAfter = 3 as "~18 minutes at the current
+// cadence", but that arithmetic only holds when each failure burns the
+// attacher's whole 6-minute timeout. Two DetachVolume paths fail immediately
+// without queuing anything at the IaaS - the busy-volume rejection
+// (EcVServerVolumeInProcess / EcVServerVolumeIsMigrating) and a failed
+// getVolumeById - and external-attacher retries those from
+// --retry-interval-start=1s, doubling. Three of them therefore stack about
+// three seconds apart, which without this floor would open the breaker in ~3s
+// and then withhold every real detach command for ten minutes. A volume that
+// is IN-PROCESS for a few seconds is routine here, so that would turn a
+// 10-40s detach into a 10-minute one.
+const BreakerTripMinElapsed = 5 * ltime.Minute
 
 // BreakerSteps is the wait before each successive real attempt once tripped.
 // The last entry is the cap: the wait stops growing there rather than doubling
@@ -119,8 +137,15 @@ func (s *Breaker) Failure(pkey BreakerKey, pterminal bool, pnow ltime.Time) (boo
 
 	if !e.tripped {
 		// A terminal error will not fix itself with more of the same call, so
-		// it trips at once instead of burning the whole threshold.
-		if pterminal || e.failures >= BreakerTripAfter {
+		// it trips at once instead of burning the whole threshold - and it
+		// bypasses BreakerTripMinElapsed deliberately: a quota that needs
+		// raising, or a volume the IaaS has parked in ERROR state, will not
+		// come right inside five minutes either.
+		//
+		// Everything else must clear both the count AND the floor, because a
+		// count on its own is satisfied by three fast rejections seconds apart
+		// (see BreakerTripMinElapsed).
+		if pterminal || (e.failures >= BreakerTripAfter && pnow.Sub(e.firstFailAt) >= BreakerTripMinElapsed) {
 			e.tripped = true
 			e.step = 0
 			e.nextAttempt = pnow.Add(BreakerSteps[0])

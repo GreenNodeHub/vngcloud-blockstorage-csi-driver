@@ -65,12 +65,15 @@ func TestOnDetachFailedEventsOnlyOnTripAndStepIncrease(t *ltesting.T) {
 	key := lsinternal.BreakerKey{VolumeID: volumeID, NodeID: nodeID}
 	ierr := nonTerminalDetachError()
 
+	// Six minutes apart: the real cadence of the incident, and far enough to
+	// clear lsinternal.BreakerTripMinElapsed - the breaker no longer trips on
+	// a burst of failures seconds apart.
 	now := ltime.Unix(0, 0)
 	gotEvents := 0
 	var messages []string
 	for i := 0; i < BreakerFailuresToWalkAllStepsAndPastCap; i++ {
 		svc.onDetachFailed(lctx.Background(), volumeID, nodeID, key, now, ierr)
-		now = now.Add(ltime.Minute)
+		now = now.Add(6 * ltime.Minute)
 
 		select {
 		case msg := <-events:
@@ -133,10 +136,12 @@ func TestOnDetachSucceededEmitsRecoveredEventWhenPreviouslyStuck(t *ltesting.T) 
 	key := lsinternal.BreakerKey{VolumeID: volumeID, NodeID: nodeID}
 	ierr := nonTerminalDetachError()
 
+	// Spaced past lsinternal.BreakerTripMinElapsed so the pair actually trips;
+	// a fast burst would not, and after Item 3 an untripped pair emits nothing.
 	now := ltime.Unix(0, 0)
 	for i := 0; i < 3; i++ {
 		svc.onDetachFailed(lctx.Background(), volumeID, nodeID, key, now, ierr)
-		now = now.Add(ltime.Minute)
+		now = now.Add(6 * ltime.Minute)
 	}
 	// Drain the trip event so it does not get mistaken for the recovery one.
 	select {

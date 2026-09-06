@@ -54,11 +54,7 @@ func TestBreakerTripsImmediatelyOnTerminal(t *ltesting.T) {
 
 func TestBreakerWalksStepsAndHoldsAtCap(t *ltesting.T) {
 	b := NewBreaker()
-	at := ltime.Unix(0, 0)
-
-	for i := 0; i < BreakerTripAfter; i++ {
-		b.Failure(bkKey, false, at)
-	}
+	at := tripBreaker(t, b, bkKey, ltime.Unix(0, 0))
 
 	// Each expiry grants exactly one real attempt; failing it advances a step.
 	for i, want := range BreakerSteps {
@@ -92,11 +88,8 @@ func TestBreakerWalksStepsAndHoldsAtCap(t *ltesting.T) {
 
 func TestBreakerSuccessClearsState(t *ltesting.T) {
 	b := NewBreaker()
-	at := ltime.Unix(0, 0)
+	at := tripBreaker(t, b, bkKey, ltime.Unix(0, 0))
 
-	for i := 0; i < BreakerTripAfter; i++ {
-		b.Failure(bkKey, false, at)
-	}
 	if got := b.Allow(bkKey, at); got != ProbeOnly {
 		t.Fatalf("Allow() = %v, want ProbeOnly", got)
 	}
@@ -134,8 +127,9 @@ func TestBreakerKeysAreIndependent(t *ltesting.T) {
 	keyA := BreakerKey{VolumeID: "vol-1", NodeID: "ins-1"}
 	keyB := BreakerKey{VolumeID: "vol-1", NodeID: "ins-2"}
 
-	for i := 0; i < BreakerTripAfter; i++ {
-		b.Failure(keyA, false, at)
+	at = tripBreaker(t, b, keyA, at)
+	if got := b.Allow(keyA, at); got != ProbeOnly {
+		t.Fatalf("the pair that failed was not tripped: Allow() = %v, want ProbeOnly", got)
 	}
 
 	if got := b.Allow(keyB, at); got != Full {
@@ -171,18 +165,16 @@ func TestBreakerIsConcurrencySafe(t *ltesting.T) {
 // handed back so the caller can clear the gauge too.
 func TestBreakerEvictStaleDropsIdleEntryAndReturnsItsKey(t *ltesting.T) {
 	b := NewBreaker()
-	start := ltime.Unix(0, 0)
+	trippedAt := tripBreaker(t, b, bkKey, ltime.Unix(0, 0))
 
-	for i := 0; i < BreakerTripAfter; i++ {
-		b.Failure(bkKey, false, start)
-	}
-	if got := b.Allow(bkKey, start); got != ProbeOnly {
+	if got := b.Allow(bkKey, trippedAt); got != ProbeOnly {
 		t.Fatalf("Allow() = %v, want ProbeOnly", got)
 	}
 
-	// Tripping on the last failure set nextAttempt = start + BreakerSteps[0];
-	// nothing touches the entry again, so staleness is measured from there.
-	dueAt := start.Add(BreakerSteps[0])
+	// Tripping on the last failure set nextAttempt = trippedAt +
+	// BreakerSteps[0]; nothing touches the entry again, so staleness is
+	// measured from there.
+	dueAt := trippedAt.Add(BreakerSteps[0])
 	capStep := BreakerSteps[len(BreakerSteps)-1]
 
 	// Not yet stale: still inside 2x the capped step past the due date.
@@ -215,12 +207,10 @@ func TestBreakerEvictStaleLeavesActiveEntriesAlone(t *ltesting.T) {
 	stale := BreakerKey{VolumeID: "vol-stale", NodeID: "ins-1"}
 	active := BreakerKey{VolumeID: "vol-active", NodeID: "ins-1"}
 
-	for i := 0; i < BreakerTripAfter; i++ {
-		b.Failure(stale, false, at)
-		b.Failure(active, false, at)
-	}
+	trippedAt := tripBreaker(t, b, stale, at)
+	tripBreaker(t, b, active, at)
 
-	dueAt := at.Add(BreakerSteps[0])
+	dueAt := trippedAt.Add(BreakerSteps[0])
 	capStep := BreakerSteps[len(BreakerSteps)-1]
 	staleAt := dueAt.Add(2*capStep + ltime.Second)
 
@@ -234,5 +224,121 @@ func TestBreakerEvictStaleLeavesActiveEntriesAlone(t *ltesting.T) {
 	}
 	if _, ok := b.Since(active, staleAt); !ok {
 		t.Fatal("EvictStale() dropped a pair that was still being touched")
+	}
+}
+
+// tripBreaker drives pkey through BreakerTripAfter non-terminal failures
+// spaced far enough apart to clear BreakerTripMinElapsed, and returns the
+// instant of the tripping failure - which is what nextAttempt is measured
+// from. Tests that need a tripped pair must go through this: a burst of
+// same-instant failures no longer trips anything.
+func tripBreaker(t *ltesting.T, pb *Breaker, pkey BreakerKey, pstart ltime.Time) ltime.Time {
+	t.Helper()
+
+	at := pstart
+	var tripped bool
+	for i := 0; i < BreakerTripAfter; i++ {
+		tripped, _ = pb.Failure(pkey, false, at)
+		if i < BreakerTripAfter-1 {
+			at = at.Add(BreakerTripMinElapsed)
+		}
+	}
+	if !tripped {
+		t.Fatalf("tripBreaker: %d failures spanning %v did not trip", BreakerTripAfter,
+			BreakerTripMinElapsed*ltime.Duration(BreakerTripAfter-1))
+	}
+
+	return at
+}
+
+// Item 1: the trip needs an elapsed-time floor, not just a failure count.
+//
+// DetachVolume has two paths that fail immediately without queuing anything at
+// the IaaS, and external-attacher retries from --retry-interval-start=1s,
+// doubling. Three such failures land ~1s/2s/4s apart. Counting alone would
+// open the breaker in about three seconds and then give the pair no real
+// detach command for ten minutes.
+func TestBreakerDoesNotTripOnAFastFailureBurst(t *ltesting.T) {
+	b := NewBreaker()
+	start := ltime.Unix(0, 0)
+
+	for i, delay := range []ltime.Duration{0, ltime.Second, 3 * ltime.Second} {
+		at := start.Add(delay)
+		tripped, stepped := b.Failure(bkKey, false, at)
+		if tripped || stepped {
+			t.Fatalf("failure %d at +%v: tripped=%v stepped=%v, want both false inside the %v floor",
+				i+1, delay, tripped, stepped, BreakerTripMinElapsed)
+		}
+		if got := b.Allow(bkKey, at); got != Full {
+			t.Fatalf("failure %d at +%v: Allow() = %v, want Full", i+1, delay, got)
+		}
+	}
+}
+
+// The failures the breaker exists for are slow ones: each burns the attacher's
+// 6-minute budget, so three of them span ~18 minutes and must trip.
+func TestBreakerTripsWhenFailuresSpanTheFloor(t *ltesting.T) {
+	b := NewBreaker()
+	start := ltime.Unix(0, 0)
+
+	b.Failure(bkKey, false, start)
+	b.Failure(bkKey, false, start.Add(6*ltime.Minute))
+
+	at := start.Add(12 * ltime.Minute)
+	tripped, _ := b.Failure(bkKey, false, at)
+	if !tripped {
+		t.Fatalf("%d failures spanning 12m did not trip", BreakerTripAfter)
+	}
+	if got := b.Allow(bkKey, at); got != ProbeOnly {
+		t.Fatalf("Allow() before nextAttempt = %v, want ProbeOnly", got)
+	}
+}
+
+// The floor delays the trip; it must not reset the count. A burst of fast
+// rejections followed by one more failure once the floor has elapsed trips on
+// that later failure.
+func TestBreakerTripsOnTheFirstFailurePastTheFloor(t *ltesting.T) {
+	b := NewBreaker()
+	start := ltime.Unix(0, 0)
+
+	for _, delay := range []ltime.Duration{0, ltime.Second, 3 * ltime.Second, 4 * ltime.Second} {
+		if tripped, _ := b.Failure(bkKey, false, start.Add(delay)); tripped {
+			t.Fatalf("tripped at +%v, inside the %v floor", delay, BreakerTripMinElapsed)
+		}
+	}
+
+	late := start.Add(BreakerTripMinElapsed + ltime.Second)
+	tripped, stepped := b.Failure(bkKey, false, late)
+	if !tripped {
+		t.Fatalf("did not trip on the first failure past the floor (at +%v)", BreakerTripMinElapsed+ltime.Second)
+	}
+	if stepped {
+		t.Fatal("reported a step increase on the tripping failure")
+	}
+	if got := b.Allow(bkKey, late); got != ProbeOnly {
+		t.Fatalf("Allow() after trip = %v, want ProbeOnly", got)
+	}
+}
+
+// A terminal error bypasses the floor deliberately: a quota that needs raising
+// or a volume in ERROR state will not fix itself inside five minutes, so
+// waiting the floor out would only delay telling someone. Asserted against a
+// non-terminal failure at the same instant so the test measures the flag, not
+// the clock.
+func TestBreakerTerminalTripsInsideTheFloor(t *ltesting.T) {
+	at := ltime.Unix(0, 0)
+
+	nonTerminal := NewBreaker()
+	if tripped, _ := nonTerminal.Failure(bkKey, false, at); tripped {
+		t.Fatal("a non-terminal first failure must not trip inside the floor")
+	}
+
+	b := NewBreaker()
+	tripped, _ := b.Failure(bkKey, true, at)
+	if !tripped {
+		t.Fatal("a terminal failure must trip on its first occurrence, floor notwithstanding")
+	}
+	if got := b.Allow(bkKey, at); got != ProbeOnly {
+		t.Fatalf("Allow() after a terminal trip = %v, want ProbeOnly", got)
 	}
 }
