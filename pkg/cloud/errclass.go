@@ -77,11 +77,10 @@ func Classify(perr lserr.IError) Class {
 		return Class{Terminal: true, Reason: ReasonVolumeInErrorState}
 	}
 
-	// 429 must be checked BEFORE 403: the SDK flattens both into
-	// EcPermissionDenied, and only the raw statusCode tells them apart. Getting
-	// this order wrong turns quota exhaustion into a permanent "permission
+	// The SDK flattens both 429 and 403 into EcPermissionDenied. Matching on
+	// that error code alone would turn throttling into a permanent "permission
 	// denied" - the exact misreading that once misdirected an lb-controller
-	// incident diagnosis.
+	// incident diagnosis. We must check the raw statusCode instead.
 	if isThrottledStatus(perr, lhttp.StatusTooManyRequests) {
 		return Class{Reason: ReasonIaaSThrottled}
 	}
