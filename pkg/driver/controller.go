@@ -245,8 +245,14 @@ func (s *controllerService) CreateVolume(pctx lctx.Context, preq *lcsi.CreateVol
 	newVol, sdkErr := s.cloud.EitherCreateResizeVolume(cvr.ToSdkCreateVolumeRequest())
 	if sdkErr != nil {
 		llog.ErrorS(sdkErr.GetError(), "[ERROR] - CreateVolume: failed to create volume", "errMsg", sdkErr.GetErrorMessages())
+		cls := lscloud.Classify(sdkErr)
+		lsmetrics.Recorder().IncreaseCount(MetricIaaSErrors, map[string]string{
+			"op": "create", "reason": cls.Reason,
+		})
+		// A specific reason is what makes this event actionable: "quota
+		// exhausted" needs a human, "throttled" resolves itself.
 		s.k8sClient.PersistentVolumeClaimEventWarning(pctx, cvr.PvcNamespaceTag, cvr.PvcNameTag,
-			"CsiCreateVolumeFailure", sdkErr.GetMessage())
+			cls.Reason, sdkErr.GetMessage())
 		return nil, sdkErr.GetError()
 	}
 
