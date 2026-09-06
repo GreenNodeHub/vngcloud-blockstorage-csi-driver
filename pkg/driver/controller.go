@@ -466,12 +466,21 @@ func (s *controllerService) onDetachFailed(
 ) {
 	cls := lscloud.Classify(pierr)
 	tripped, stepped := s.detachBreaker.Failure(pkey, cls.Terminal, pnow)
+	stuck, _, isTripped := s.detachBreaker.Since(pkey, pnow)
 
+	// Unconditional: iaas_errors_total is the series that covers failures the
+	// breaker has not opened on yet.
 	lsmetrics.Recorder().IncreaseCount(MetricIaaSErrors, map[string]string{
 		"op": "detach", "reason": cls.Reason,
 	})
 
-	if stuck, ok := s.detachBreaker.Since(pkey, pnow); ok {
+	// The gauge is only meaningful for a pair the breaker has actually opened
+	// on. Publishing a series born at 0s for every transient failure is churn
+	// with no signal, and every such series then has to be evicted again.
+	// isTripped covers all three cases at once - this failure tripped it, this
+	// failure stepped it, or it was already open - because Failure has already
+	// updated the entry by the time Since reads it.
+	if isTripped {
 		lsmetrics.Recorder().SetGauge(MetricDetachPendingSeconds, stuck.Seconds(), map[string]string{
 			"volume_id": pvolumeID, "node_id": pnodeID,
 		})
@@ -485,7 +494,6 @@ func (s *controllerService) onDetachFailed(
 		"reason": cls.Reason,
 	})
 
-	stuck, _ := s.detachBreaker.Since(pkey, pnow)
 	msg := lfmt.Sprintf(
 		"Detach %s from %s keeps failing (%s, stuck for %s). Pausing IaaS detach calls; state will still be probed on each retry.",
 		pvolumeID, pnodeID, cls.Reason, stuck.Round(ltime.Second),
@@ -498,14 +506,22 @@ func (s *controllerService) onDetachFailed(
 func (s *controllerService) onDetachSucceeded(
 	pctx lctx.Context, pvolumeID, pnodeID string, pkey lsinternal.BreakerKey, pnow ltime.Time,
 ) {
-	stuck, wasTracked := s.detachBreaker.Since(pkey, pnow)
+	stuck, _, wasTripped := s.detachBreaker.Since(pkey, pnow)
 	s.detachBreaker.Success(pkey)
 
+	// Unconditional: deleting an absent series is a cheap no-op, and it is the
+	// one call that must not be skipped by mistake.
 	lsmetrics.Recorder().DeleteGauge(MetricDetachPendingSeconds, map[string]string{
 		"volume_id": pvolumeID, "node_id": pnodeID,
 	})
 
-	if !wasTracked {
+	// Only a pair that actually tripped gets a recovery event. A pair that
+	// merely had one transient failure was never reported as stuck, so there
+	// is nothing to report as recovered - and each event costs a full
+	// unpaginated PersistentVolumes().List() (see
+	// FindPersistentVolumeByHandle), which must stay a per-stuck-volume cost,
+	// never a per-detach one.
+	if !wasTripped {
 		return
 	}
 

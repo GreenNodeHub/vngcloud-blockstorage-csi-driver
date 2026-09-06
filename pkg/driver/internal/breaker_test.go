@@ -98,7 +98,7 @@ func TestBreakerSuccessClearsState(t *ltesting.T) {
 	if got := b.Allow(bkKey, at); got != Full {
 		t.Fatalf("Allow() after Success = %v, want Full", got)
 	}
-	if _, ok := b.Since(bkKey, at); ok {
+	if _, ok, _ := b.Since(bkKey, at); ok {
 		t.Fatal("Since() still reports a stuck pair after Success")
 	}
 }
@@ -112,7 +112,7 @@ func TestBreakerSinceMeasuresFromFirstFailure(t *ltesting.T) {
 	b.Failure(bkKey, false, start)
 	b.Failure(bkKey, false, start.Add(6*ltime.Minute))
 
-	got, ok := b.Since(bkKey, start.Add(20*ltime.Minute))
+	got, ok, _ := b.Since(bkKey, start.Add(20*ltime.Minute))
 	if !ok {
 		t.Fatal("Since() = not tracked, want tracked")
 	}
@@ -182,7 +182,7 @@ func TestBreakerEvictStaleDropsIdleEntryAndReturnsItsKey(t *ltesting.T) {
 	if evicted := b.EvictStale(notStaleAt); len(evicted) != 0 {
 		t.Fatalf("EvictStale() = %v before the idle window elapsed, want none evicted", evicted)
 	}
-	if _, ok := b.Since(bkKey, notStaleAt); !ok {
+	if _, ok, _ := b.Since(bkKey, notStaleAt); !ok {
 		t.Fatal("entry evicted too early")
 	}
 
@@ -192,7 +192,7 @@ func TestBreakerEvictStaleDropsIdleEntryAndReturnsItsKey(t *ltesting.T) {
 	if len(evicted) != 1 || evicted[0] != bkKey {
 		t.Fatalf("EvictStale() = %v, want exactly [%v]", evicted, bkKey)
 	}
-	if _, ok := b.Since(bkKey, staleAt); ok {
+	if _, ok, _ := b.Since(bkKey, staleAt); ok {
 		t.Fatal("Since() still reports the evicted pair")
 	}
 	// And it is fully forgotten, not merely marked: a fresh Allow starts at Full.
@@ -222,7 +222,7 @@ func TestBreakerEvictStaleLeavesActiveEntriesAlone(t *ltesting.T) {
 	if len(evicted) != 1 || evicted[0] != stale {
 		t.Fatalf("EvictStale() = %v, want exactly [%v]", evicted, stale)
 	}
-	if _, ok := b.Since(active, staleAt); !ok {
+	if _, ok, _ := b.Since(active, staleAt); !ok {
 		t.Fatal("EvictStale() dropped a pair that was still being touched")
 	}
 }
@@ -340,5 +340,34 @@ func TestBreakerTerminalTripsInsideTheFloor(t *ltesting.T) {
 	}
 	if got := b.Allow(bkKey, at); got != ProbeOnly {
 		t.Fatalf("Allow() after a terminal trip = %v, want ProbeOnly", got)
+	}
+}
+
+// Since must separate "tracked" from "tripped". An entry exists from failure
+// #1, but the handler may only report a pair as stuck once the breaker has
+// actually opened on it - reporting on merely tracked pairs means one
+// unpaginated PV LIST per transient detach failure.
+func TestBreakerSinceSeparatesTrackedFromTripped(t *ltesting.T) {
+	b := NewBreaker()
+	start := ltime.Unix(0, 0)
+
+	if _, tracked, tripped := b.Since(bkKey, start); tracked || tripped {
+		t.Fatalf("untouched pair: tracked=%v tripped=%v, want both false", tracked, tripped)
+	}
+
+	b.Failure(bkKey, false, start)
+	_, tracked, tripped := b.Since(bkKey, start.Add(ltime.Second))
+	if !tracked {
+		t.Fatal("after one failure the pair must be tracked")
+	}
+	if tripped {
+		t.Fatal("one failure must not report the pair as tripped")
+	}
+
+	// A pair of its own, so the helper starts from a clean entry.
+	trippedKey := BreakerKey{VolumeID: "vol-tripped", NodeID: "ins-1"}
+	at := tripBreaker(t, b, trippedKey, start)
+	if _, tracked, tripped = b.Since(trippedKey, at); !tracked || !tripped {
+		t.Fatalf("after tripping: tracked=%v tripped=%v, want both true", tracked, tripped)
 	}
 }

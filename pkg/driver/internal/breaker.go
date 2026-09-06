@@ -176,18 +176,27 @@ func (s *Breaker) Success(pkey BreakerKey) {
 	delete(s.entries, pkey.String())
 }
 
-// Since reports how long pkey has been failing, measured from its first
-// failure - that is the number the detach_pending_seconds gauge publishes.
-func (s *Breaker) Since(pkey BreakerKey, pnow ltime.Time) (ltime.Duration, bool) {
+// Since reports, in one lock acquisition, everything the handler needs to know
+// about a pair: how long it has been failing (measured from its FIRST failure -
+// that is the number the detach_pending_seconds gauge publishes), whether it is
+// tracked at all, and whether it is currently tripped.
+//
+// tracked and tripped are not the same thing and the caller must not confuse
+// them: an entry exists from failure #1, but the breaker only opens once the
+// count and BreakerTripMinElapsed are both satisfied. Reporting on merely
+// tracked pairs means reporting on every transient failure. The two flags come
+// back together rather than from a separate Tripped() call so the success path
+// still takes this lock exactly once.
+func (s *Breaker) Since(pkey BreakerKey, pnow ltime.Time) (ltime.Duration, bool, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	e, ok := s.entries[pkey.String()]
 	if !ok {
-		return 0, false
+		return 0, false, false
 	}
 
-	return pnow.Sub(e.firstFailAt), true
+	return pnow.Sub(e.firstFailAt), true, e.tripped
 }
 
 // EvictStale drops every entry that has gone untouched for twice the capped
