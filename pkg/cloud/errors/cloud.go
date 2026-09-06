@@ -24,7 +24,12 @@ var (
 			WithMessage(lfmt.Sprintf("Failed to detach volume %s from instance %s", pvolId, pinstanceId)).
 			WithKVparameters("instanceId", pinstanceId, "volumeId", pvolId)
 		if psdkErr != nil {
-			e = e.WithErrors(psdkErr.GetError()).WithParameters(psdkErr.GetParameters())
+			// WithErrorCode above overwrites the SDK's own code with this
+			// wrapper's, and other call sites match on the wrapper code, so it
+			// has to stay. Stash the SDK code as a parameter instead - it is
+			// the only thing that tells cloud.Classify WHY the call failed.
+			e = e.WithErrors(psdkErr.GetError()).WithParameters(psdkErr.GetParameters()).
+				WithKVparameters("sdkErrorCode", string(psdkErr.GetErrorCode()))
 		}
 
 		return NewError(e)
@@ -39,7 +44,12 @@ var (
 			WithMessage(lfmt.Sprintf("Failed to get volume %s", pvolId)).
 			WithKVparameters("volumeId", pvolId)
 		if psdkErr != nil {
-			e = e.WithErrors(psdkErr.GetError()).WithParameters(psdkErr.GetParameters())
+			// WithErrorCode above overwrites the SDK's own code with this
+			// wrapper's, and other call sites match on the wrapper code, so it
+			// has to stay. Stash the SDK code as a parameter instead - it is
+			// the only thing that tells cloud.Classify WHY the call failed.
+			e = e.WithErrors(psdkErr.GetError()).WithParameters(psdkErr.GetParameters()).
+				WithKVparameters("sdkErrorCode", string(psdkErr.GetErrorCode()))
 		}
 
 		return NewError(e)
@@ -54,7 +64,12 @@ var (
 			WithMessage(lfmt.Sprintf("Failed to delete volume %s", pvolId)).
 			WithKVparameters("volumeId", pvolId)
 		if psdkErr != nil {
-			e = e.WithErrors(psdkErr.GetError()).WithParameters(psdkErr.GetParameters())
+			// WithErrorCode above overwrites the SDK's own code with this
+			// wrapper's, and other call sites match on the wrapper code, so it
+			// has to stay. Stash the SDK code as a parameter instead - it is
+			// the only thing that tells cloud.Classify WHY the call failed.
+			e = e.WithErrors(psdkErr.GetError()).WithParameters(psdkErr.GetParameters()).
+				WithKVparameters("sdkErrorCode", string(psdkErr.GetErrorCode()))
 		}
 
 		return NewError(e)
@@ -76,7 +91,12 @@ var (
 			WithMessage(lfmt.Sprintf("Failed to attach volume %s to instance %s", pvolId, pinstanceId)).
 			WithKVparameters("instanceId", pinstanceId, "volumeId", pvolId)
 		if psdkErr != nil {
-			e = e.WithErrors(psdkErr.GetError()).WithParameters(psdkErr.GetParameters())
+			// WithErrorCode above overwrites the SDK's own code with this
+			// wrapper's, and other call sites match on the wrapper code, so it
+			// has to stay. Stash the SDK code as a parameter instead - it is
+			// the only thing that tells cloud.Classify WHY the call failed.
+			e = e.WithErrors(psdkErr.GetError()).WithParameters(psdkErr.GetParameters()).
+				WithKVparameters("sdkErrorCode", string(psdkErr.GetErrorCode()))
 		}
 
 		return NewError(e)

@@ -64,7 +64,7 @@ func Classify(perr lserr.IError) Class {
 		return Class{}
 	}
 
-	code := perr.GetErrorCode()
+	code := effectiveCode(perr)
 
 	switch {
 	case errSetQuotaExceeded.ContainsOne(code):
@@ -95,9 +95,37 @@ func Classify(perr lserr.IError) Class {
 		return Class{Reason: ReasonIaaSOperationStalled}
 	case code == ecCsiClientRateLimited:
 		return Class{Reason: ReasonIaaSThrottled}
+	case code == lserr.EcVServerVolumeFailedToDetach:
+		// No SDK code at all: the wait helpers build this one with
+		// psdkErr == nil, meaning the IaaS ACCEPTED the detach and the volume
+		// then never finished. That is exactly the 23-hour incident's error.
+		return Class{Reason: ReasonIaaSOperationStalled}
 	}
 
+	// EcVServerVolumeFailedToGet is deliberately left to fall through to
+	// unknown: a failed READ says nothing about what state the volume is in.
 	return Class{Reason: ReasonIaaSUnknownError}
+}
+
+// effectiveCode returns the SDK's own error code when the driver's wrappers
+// preserved one, and the wrapper's code otherwise.
+//
+// lserr.ErrVolumeFailedToDetach and its siblings stamp a single driver code
+// over whatever the SDK reported, so reading GetErrorCode() alone flattens
+// every detach failure - quota, 500, busy volume - into one indistinguishable
+// value, and Classify answered ReasonIaaSUnknownError for all of them. That is
+// the same trap one level up from the SDK's own flattening of 429 and 403 into
+// EcPermissionDenied - see the comment on the isThrottledStatus checks in
+// Classify: a code that has already lost a distinction cannot be used to make
+// it.
+func effectiveCode(perr lserr.IError) lsdkErrs.ErrorCode {
+	if raw, ok := perr.GetParameters()["sdkErrorCode"]; ok {
+		if s, ok := raw.(string); ok && s != "" {
+			return lsdkErrs.ErrorCode(s)
+		}
+	}
+
+	return perr.GetErrorCode()
 }
 
 // isThrottledStatus reads the raw statusCode the SDK stashes in the error
