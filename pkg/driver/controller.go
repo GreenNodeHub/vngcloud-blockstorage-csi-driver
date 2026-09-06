@@ -14,6 +14,7 @@ import (
 	lsdkEntity "github.com/vngcloud/vngcloud-go-sdk/v2/vngcloud/entity"
 	lsdkErrs "github.com/vngcloud/vngcloud-go-sdk/v2/vngcloud/sdk_error"
 	lts "google.golang.org/protobuf/types/known/timestamppb"
+	lcoreV1 "k8s.io/api/core/v1"
 	lk8srecord "k8s.io/client-go/tools/record"
 	llog "k8s.io/klog/v2"
 
@@ -22,6 +23,7 @@ import (
 	lserr "github.com/vngcloud/vngcloud-blockstorage-csi-driver/pkg/cloud/errors"
 	lsinternal "github.com/vngcloud/vngcloud-blockstorage-csi-driver/pkg/driver/internal"
 	lsk8s "github.com/vngcloud/vngcloud-blockstorage-csi-driver/pkg/k8s"
+	lsmetrics "github.com/vngcloud/vngcloud-blockstorage-csi-driver/pkg/metrics"
 	lsutil "github.com/vngcloud/vngcloud-blockstorage-csi-driver/pkg/util"
 )
 
@@ -29,6 +31,7 @@ type controllerService struct {
 	cloud               lscloud.Cloud
 	inFlight            *lsinternal.InFlight
 	createGate          *lsinternal.Semaphore
+	detachBreaker       *lsinternal.Breaker
 	modifyVolumeManager *modifyVolumeManager
 	driverOptions       *DriverOptions
 	k8sClient           lsk8s.IKubernetes
@@ -68,6 +71,7 @@ func newControllerService(pdriOpts *DriverOptions) controllerService {
 		cloud:               cloudSrv,
 		inFlight:            lsinternal.NewInFlight(),
 		createGate:          lsinternal.NewSemaphore(pdriOpts.maxConcurrentVolumeCreates),
+		detachBreaker:       lsinternal.NewBreaker(),
 		driverOptions:       pdriOpts,
 		modifyVolumeManager: newModifyVolumeManager(),
 		k8sClient:           lsk8s.NewKubernetes(k8sClient, recorder),
@@ -390,13 +394,115 @@ func (s *controllerService) ControllerUnpublishVolume(pctx lctx.Context, preq *l
 		s.inFlight.Delete(volumeID + nodeID)
 	}()
 
-	if ierr := s.cloud.DetachVolume(pctx, nodeID, volumeID); ierr != nil {
-		llog.ErrorS(ierr.GetError(), "[ERROR] - ControllerUnpublishVolume: Failed to detach volume from instance", "volumeID", volumeID, "nodeID", nodeID)
+	now := ltime.Now()
+
+	// While the breaker is open we stop commanding the IaaS and only read
+	// state. A stuck detach used to cost ~13 vServer calls every 6 minutes for
+	// as long as it stayed stuck (23 hours, ~3,000 calls, in the incident this
+	// guards against), all from a quota bucket shared across the project.
+	if s.detachBreaker.Allow(key, now) == lsinternal.ProbeOnly {
+		detached, ierr := s.cloud.IsDetachedFrom(pctx, nodeID, volumeID)
+		if ierr == nil && detached {
+			s.onDetachSucceeded(pctx, volumeID, nodeID, key, now)
+
+			return &lcsi.ControllerUnpublishVolumeResponse{}, nil
+		}
+
+		// A failed probe says nothing about whether the IaaS accepts commands,
+		// so it must NOT advance the backoff.
+		llog.InfoS("[INFO] - ControllerUnpublishVolume: detach paused by breaker, still attached",
+			"volumeID", volumeID, "nodeID", nodeID)
+
 		return nil, ErrDetachVolume(volumeID, nodeID)
 	}
 
+	if ierr := s.cloud.DetachVolume(pctx, nodeID, volumeID); ierr != nil {
+		llog.ErrorS(ierr.GetError(), "[ERROR] - ControllerUnpublishVolume: Failed to detach volume from instance", "volumeID", volumeID, "nodeID", nodeID)
+		s.onDetachFailed(pctx, volumeID, nodeID, key, now, ierr)
+
+		return nil, ErrDetachVolume(volumeID, nodeID)
+	}
+
+	s.onDetachSucceeded(pctx, volumeID, nodeID, key, now)
 	llog.InfoS("[INFO] - ControllerUnpublishVolume: Volume detached from instance successfully", "volumeID", volumeID, "nodeID", nodeID)
+
 	return &lcsi.ControllerUnpublishVolumeResponse{}, nil
+}
+
+// onDetachFailed records a real failed attempt, and reports it once per
+// escalation rather than once per retry - the incident this guards against
+// would have produced 5 events instead of ~230.
+func (s *controllerService) onDetachFailed(
+	pctx lctx.Context, pvolumeID, pnodeID, pkey string, pnow ltime.Time, pierr lserr.IError,
+) {
+	cls := lscloud.Classify(pierr)
+	tripped, stepped := s.detachBreaker.Failure(pkey, cls.Terminal, pnow)
+
+	lsmetrics.Recorder().IncreaseCount(MetricIaaSErrors, map[string]string{
+		"op": "detach", "reason": cls.Reason,
+	})
+
+	if stuck, ok := s.detachBreaker.Since(pkey, pnow); ok {
+		lsmetrics.Recorder().SetGauge(MetricDetachPendingSeconds, stuck.Seconds(), map[string]string{
+			"volume_id": pvolumeID, "node_id": pnodeID,
+		})
+	}
+
+	if !tripped && !stepped {
+		return
+	}
+
+	lsmetrics.Recorder().IncreaseCount(MetricDetachBreakerTrips, map[string]string{
+		"reason": cls.Reason,
+	})
+
+	stuck, _ := s.detachBreaker.Since(pkey, pnow)
+	msg := lfmt.Sprintf(
+		"Detach %s from %s keeps failing (%s, stuck for %s). Pausing IaaS detach calls; state will still be probed on each retry.",
+		pvolumeID, pnodeID, cls.Reason, stuck.Round(ltime.Second),
+	)
+	s.emitVolumeEvent(pctx, pvolumeID, lcoreV1.EventTypeWarning, "VolumeDetachStalled", msg)
+}
+
+// onDetachSucceeded clears the breaker, drops the gauge series so nothing
+// keeps alerting, and says so out loud if the pair had been stuck.
+func (s *controllerService) onDetachSucceeded(
+	pctx lctx.Context, pvolumeID, pnodeID, pkey string, pnow ltime.Time,
+) {
+	stuck, wasTracked := s.detachBreaker.Since(pkey, pnow)
+	s.detachBreaker.Success(pkey)
+
+	lsmetrics.Recorder().DeleteGauge(MetricDetachPendingSeconds, map[string]string{
+		"volume_id": pvolumeID, "node_id": pnodeID,
+	})
+
+	if !wasTracked {
+		return
+	}
+
+	msg := lfmt.Sprintf("Detach %s from %s succeeded after being stuck for %s.",
+		pvolumeID, pnodeID, stuck.Round(ltime.Second))
+	s.emitVolumeEvent(pctx, pvolumeID, lcoreV1.EventTypeNormal, "VolumeDetachRecovered", msg)
+}
+
+// emitVolumeEvent resolves the IaaS volume ID to its PV and emits there (and on
+// the PVC if it still exists). Every failure is swallowed: reporting a problem
+// must never create one.
+func (s *controllerService) emitVolumeEvent(pctx lctx.Context, pvolumeID, peventType, preason, pmessage string) {
+	pv, ierr := s.k8sClient.FindPersistentVolumeByHandle(pctx, pvolumeID)
+	if ierr != nil || pv == nil || pv.PersistentVolume == nil {
+		llog.V(2).InfoS("[DEBUG] - emitVolumeEvent: no PV for this volume, skipping event",
+			"volumeID", pvolumeID, "reason", preason)
+
+		return
+	}
+
+	if peventType == lcoreV1.EventTypeNormal {
+		s.k8sClient.VolumeEventNormal(pctx, pv.PersistentVolume.Name, preason, pmessage)
+
+		return
+	}
+	s.k8sClient.VolumeEventWarning(pctx, pv.PersistentVolume.Name, preason, pmessage)
 }
 
 func (s *controllerService) CreateSnapshot(_ lctx.Context, preq *lcsi.CreateSnapshotRequest) (*lcsi.CreateSnapshotResponse, error) {
