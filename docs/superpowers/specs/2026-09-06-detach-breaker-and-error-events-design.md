@@ -259,6 +259,12 @@ PR-B: create-path reason from `Classify`, `iaas_errors_total{op=create}`.
 Both to `dev` first, image built by `build_dev.yml`, verified on the test cluster with the
 runner, then ported to `main`.
 
+The new metrics only exist if the deployment passes `--http-endpoint`, which defaults empty
+(`cmd/vngcloud-blockstorage-csi-driver/main.go:44` only initialises the recorder when it is
+set). The Helm chart lives outside this repo, so until the chart sets that flag and a scrape
+target exists, the metric half of the "tell people" goal ships dark - the events are the only
+signal that reaches anyone.
+
 ## 8. Comparison with aws-ebs-csi-driver (commit 36d7fd88)
 
 - Same detach shape (`DetachVolume` then `WaitForAttachmentState`, backoff 1s×1.8^n×13),
