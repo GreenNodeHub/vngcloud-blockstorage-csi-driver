@@ -71,6 +71,41 @@ func (m *metricRecorder) ObserveHistogram(name string, value float64, labels map
 	metric.(*metrics.HistogramVec).With(metrics.Labels(labels)).Observe(value)
 }
 
+// SetGauge publishes an absolute value for one label set, registering the
+// metric on first use. Unlike the counters here, a gauge must be able to go
+// down and to disappear - see DeleteGauge.
+func (m *metricRecorder) SetGauge(name string, value float64, labels map[string]string) {
+	if m == nil {
+		return // recorder is not initialized
+	}
+
+	metric, ok := m.metrics[name]
+
+	if !ok {
+		klog.V(4).InfoS("Metric not found, registering", "name", name, "labels", labels)
+		m.registerGaugeVec(name, "ebs_csi_aws_com metric", getLabelNames(labels))
+		m.SetGauge(name, value, labels)
+		return
+	}
+
+	metric.(*metrics.GaugeVec).With(metrics.Labels(labels)).Set(value)
+}
+
+// DeleteGauge drops one series. Needed because a recovered volume must stop
+// reporting "stuck for N seconds" - a stale series would alert forever.
+func (m *metricRecorder) DeleteGauge(name string, labels map[string]string) {
+	if m == nil {
+		return // recorder is not initialized
+	}
+
+	metric, ok := m.metrics[name]
+	if !ok {
+		return
+	}
+
+	metric.(*metrics.GaugeVec).Delete(metrics.Labels(labels))
+}
+
 // InitializeMetricsHandler starts a new HTTP server to expose the metrics.
 func (m *metricRecorder) InitializeMetricsHandler(address, path string) {
 	if m == nil {
@@ -117,6 +152,26 @@ func (m *metricRecorder) registerCounterVec(name, help string, labels []string) 
 	counter := createCounterVec(name, help, labels)
 	m.metrics[name] = counter
 	m.registry.MustRegister(counter)
+}
+
+func (m *metricRecorder) registerGaugeVec(name, help string, labels []string) {
+	if _, exists := m.metrics[name]; exists {
+		return
+	}
+	gauge := createGaugeVec(name, help, labels)
+	m.metrics[name] = gauge
+	m.registry.MustRegister(gauge)
+}
+
+func createGaugeVec(name, help string, labels []string) *metrics.GaugeVec {
+	return metrics.NewGaugeVec(
+		&metrics.GaugeOpts{
+			Name:           name,
+			Help:           help,
+			StabilityLevel: metrics.ALPHA,
+		},
+		labels,
+	)
 }
 
 func createHistogramVec(name, help string, labels []string, buckets []float64) *metrics.HistogramVec {
