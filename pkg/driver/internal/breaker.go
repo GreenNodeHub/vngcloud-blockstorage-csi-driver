@@ -45,7 +45,20 @@ const (
 	ProbeOnly
 )
 
+// BreakerKey identifies a (volume, node) pair. String() is the same
+// concatenation the handler already uses for its inflight key, so the two
+// stay identical in value - but keeping the fields typed lets the breaker
+// report what it drops (see EvictStale), which a bare string cannot.
+type BreakerKey struct {
+	VolumeID, NodeID string
+}
+
+func (s BreakerKey) String() string {
+	return s.VolumeID + s.NodeID
+}
+
 type breakerEntry struct {
+	key         BreakerKey
 	failures    int
 	firstFailAt ltime.Time
 	step        int
@@ -63,11 +76,11 @@ func NewBreaker() *Breaker {
 }
 
 // Allow reports whether the caller may issue a real command for pkey.
-func (s *Breaker) Allow(pkey string, pnow ltime.Time) Decision {
+func (s *Breaker) Allow(pkey BreakerKey, pnow ltime.Time) Decision {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	e, ok := s.entries[pkey]
+	e, ok := s.entries[pkey.String()]
 	if !ok || !e.tripped {
 		return Full
 	}
@@ -88,16 +101,21 @@ func (s *Breaker) Allow(pkey string, pnow ltime.Time) Decision {
 //
 // Returns tripped when this failure trips the breaker, and stepped when it
 // advances to a longer wait. The handler emits an event on either.
-func (s *Breaker) Failure(pkey string, pterminal bool, pnow ltime.Time) (bool, bool) {
+func (s *Breaker) Failure(pkey BreakerKey, pterminal bool, pnow ltime.Time) (bool, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	e, ok := s.entries[pkey]
+	e, ok := s.entries[pkey.String()]
 	if !ok {
-		e = &breakerEntry{firstFailAt: pnow}
-		s.entries[pkey] = e
+		e = &breakerEntry{key: pkey, firstFailAt: pnow}
+		s.entries[pkey.String()] = e
 	}
 	e.failures++
+	// Last-touched marker for EvictStale. Once tripped this gets overwritten
+	// below by the real next-attempt due date; until then it just says "this
+	// pair was still failing as of pnow", so an untripped entry that stops
+	// being touched goes stale on the same clock as a tripped one.
+	e.nextAttempt = pnow
 
 	if !e.tripped {
 		// A terminal error will not fix itself with more of the same call, so
@@ -126,23 +144,56 @@ func (s *Breaker) Failure(pkey string, pterminal bool, pnow ltime.Time) (bool, b
 }
 
 // Success clears the pair: the volume detached, nothing left to track.
-func (s *Breaker) Success(pkey string) {
+func (s *Breaker) Success(pkey BreakerKey) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	delete(s.entries, pkey)
+	delete(s.entries, pkey.String())
 }
 
 // Since reports how long pkey has been failing, measured from its first
 // failure - that is the number the detach_pending_seconds gauge publishes.
-func (s *Breaker) Since(pkey string, pnow ltime.Time) (ltime.Duration, bool) {
+func (s *Breaker) Since(pkey BreakerKey, pnow ltime.Time) (ltime.Duration, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	e, ok := s.entries[pkey]
+	e, ok := s.entries[pkey.String()]
 	if !ok {
 		return 0, false
 	}
 
 	return pnow.Sub(e.firstFailAt), true
+}
+
+// EvictStale drops every entry that has gone untouched for twice the capped
+// step, and returns the keys it dropped.
+//
+// Every Failure call stamps nextAttempt - either to pnow itself, before the
+// pair has tripped, or to the next due date once it has - so "untouched past
+// 2 * cap" means no ControllerUnpublishVolume call has landed on this pair
+// for a long time after it should have. That is either a volume that is
+// gone, or one unstuck by something other than a successful
+// ControllerUnpublishVolume (a force-deleted VolumeAttachment, a
+// garbage-collected Machine, ...): either way nothing should still be
+// probing it or reporting it stuck.
+//
+// Lazy: no background goroutine. The caller is expected to invoke this
+// explicitly (never from inside Allow, which already holds this lock for one
+// key) and clear any gauge series for the keys returned.
+func (s *Breaker) EvictStale(pnow ltime.Time) []BreakerKey {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	capStep := BreakerSteps[len(BreakerSteps)-1]
+	staleBefore := pnow.Add(-2 * capStep)
+
+	var evicted []BreakerKey
+	for k, e := range s.entries {
+		if e.nextAttempt.Before(staleBefore) {
+			evicted = append(evicted, e.key)
+			delete(s.entries, k)
+		}
+	}
+
+	return evicted
 }

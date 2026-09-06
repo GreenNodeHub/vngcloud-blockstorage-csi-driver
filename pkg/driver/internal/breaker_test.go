@@ -6,7 +6,7 @@ import (
 	ltime "time"
 )
 
-const bkKey = "vol-1ins-1"
+var bkKey = BreakerKey{VolumeID: "vol-1", NodeID: "ins-1"}
 
 func TestBreakerAllowsFullUntilTripAfterFailures(t *ltesting.T) {
 	b := NewBreaker()
@@ -131,12 +131,14 @@ func TestBreakerSinceMeasuresFromFirstFailure(t *ltesting.T) {
 func TestBreakerKeysAreIndependent(t *ltesting.T) {
 	b := NewBreaker()
 	at := ltime.Unix(0, 0)
+	keyA := BreakerKey{VolumeID: "vol-1", NodeID: "ins-1"}
+	keyB := BreakerKey{VolumeID: "vol-1", NodeID: "ins-2"}
 
 	for i := 0; i < BreakerTripAfter; i++ {
-		b.Failure("vol-1ins-1", false, at)
+		b.Failure(keyA, false, at)
 	}
 
-	if got := b.Allow("vol-1ins-2", at); got != Full {
+	if got := b.Allow(keyB, at); got != Full {
 		t.Fatalf("a different pair was affected: Allow() = %v, want Full", got)
 	}
 }
@@ -157,4 +159,80 @@ func TestBreakerIsConcurrencySafe(t *ltesting.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+// A pair unstuck by something other than a successful ControllerUnpublishVolume
+// (an operator force-deleting the VolumeAttachment, a garbage-collected
+// Machine, ...) never calls Success. Left behind, its entry - and the gauge
+// series keyed off it - would sit frozen forever and the "stuck > 30m" alert
+// this feature exists to raise would fire permanently on a healthy cluster.
+// EvictStale is the lazy, no-goroutine way out: anything idle past twice the
+// capped step, measured from its nextAttempt due date, is dropped and its key
+// handed back so the caller can clear the gauge too.
+func TestBreakerEvictStaleDropsIdleEntryAndReturnsItsKey(t *ltesting.T) {
+	b := NewBreaker()
+	start := ltime.Unix(0, 0)
+
+	for i := 0; i < BreakerTripAfter; i++ {
+		b.Failure(bkKey, false, start)
+	}
+	if got := b.Allow(bkKey, start); got != ProbeOnly {
+		t.Fatalf("Allow() = %v, want ProbeOnly", got)
+	}
+
+	// Tripping on the last failure set nextAttempt = start + BreakerSteps[0];
+	// nothing touches the entry again, so staleness is measured from there.
+	dueAt := start.Add(BreakerSteps[0])
+	capStep := BreakerSteps[len(BreakerSteps)-1]
+
+	// Not yet stale: still inside 2x the capped step past the due date.
+	notStaleAt := dueAt.Add(2*capStep - ltime.Second)
+	if evicted := b.EvictStale(notStaleAt); len(evicted) != 0 {
+		t.Fatalf("EvictStale() = %v before the idle window elapsed, want none evicted", evicted)
+	}
+	if _, ok := b.Since(bkKey, notStaleAt); !ok {
+		t.Fatal("entry evicted too early")
+	}
+
+	// Past the idle window: the entry (and only this one) must go.
+	staleAt := dueAt.Add(2*capStep + ltime.Second)
+	evicted := b.EvictStale(staleAt)
+	if len(evicted) != 1 || evicted[0] != bkKey {
+		t.Fatalf("EvictStale() = %v, want exactly [%v]", evicted, bkKey)
+	}
+	if _, ok := b.Since(bkKey, staleAt); ok {
+		t.Fatal("Since() still reports the evicted pair")
+	}
+	// And it is fully forgotten, not merely marked: a fresh Allow starts at Full.
+	if got := b.Allow(bkKey, staleAt); got != Full {
+		t.Fatalf("Allow() after eviction = %v, want Full", got)
+	}
+}
+
+func TestBreakerEvictStaleLeavesActiveEntriesAlone(t *ltesting.T) {
+	b := NewBreaker()
+	at := ltime.Unix(0, 0)
+	stale := BreakerKey{VolumeID: "vol-stale", NodeID: "ins-1"}
+	active := BreakerKey{VolumeID: "vol-active", NodeID: "ins-1"}
+
+	for i := 0; i < BreakerTripAfter; i++ {
+		b.Failure(stale, false, at)
+		b.Failure(active, false, at)
+	}
+
+	dueAt := at.Add(BreakerSteps[0])
+	capStep := BreakerSteps[len(BreakerSteps)-1]
+	staleAt := dueAt.Add(2*capStep + ltime.Second)
+
+	// The active pair gets touched right before the eviction check (its own
+	// due date lands long after staleAt), the stale one does not.
+	b.Failure(active, false, staleAt.Add(-ltime.Second))
+
+	evicted := b.EvictStale(staleAt)
+	if len(evicted) != 1 || evicted[0] != stale {
+		t.Fatalf("EvictStale() = %v, want exactly [%v]", evicted, stale)
+	}
+	if _, ok := b.Since(active, staleAt); !ok {
+		t.Fatal("EvictStale() dropped a pair that was still being touched")
+	}
 }
