@@ -18,7 +18,7 @@ const (
 	// creates finished 31% faster than 100 with 92% fewer vServer 500s -
 	// vServer chokes on concurrency, not on request rate.
 	DefaultMaxConcurrentVolumeCreates = 10
-	AgentNotReadyNodeTaintKey                = "csi.vngcloud.vn/agent-not-ready"
+	AgentNotReadyNodeTaintKey         = "csi.vngcloud.vn/agent-not-ready"
 
 	DefaultTimeoutModifyChannel = 10 * ltime.Minute
 	WellKnownZoneTopologyKey    = "topology.kubernetes.io/zone"
