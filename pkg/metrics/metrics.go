@@ -17,6 +17,7 @@ var (
 type metricRecorder struct {
 	registry metrics.KubeRegistry
 	metrics  map[string]interface{}
+	mutex    sync.Mutex
 }
 
 // Recorder returns the singleton instance of metricRecorder.
@@ -42,13 +43,14 @@ func (m *metricRecorder) IncreaseCount(name string, labels map[string]string) {
 		return // recorder is not initialized
 	}
 
-	metric, ok := m.metrics[name]
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
 
+	metric, ok := m.metrics[name]
 	if !ok {
 		klog.V(4).InfoS("Metric not found, registering", "name", name, "labels", labels)
 		m.registerCounterVec(name, "ebs_csi_aws_com metric", getLabelNames(labels))
-		m.IncreaseCount(name, labels)
-		return
+		metric = m.metrics[name]
 	}
 
 	metric.(*metrics.CounterVec).With(metrics.Labels(labels)).Inc()
@@ -59,16 +61,57 @@ func (m *metricRecorder) ObserveHistogram(name string, value float64, labels map
 	if m == nil {
 		return // recorder is not initialized
 	}
-	metric, ok := m.metrics[name]
 
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
+	metric, ok := m.metrics[name]
 	if !ok {
 		klog.V(4).InfoS("Metric not found, registering", "name", name, "labels", labels, "buckets", buckets)
 		m.registerHistogramVec(name, "ebs_csi_aws_com metric", getLabelNames(labels), buckets)
-		m.ObserveHistogram(name, value, labels, buckets)
-		return
+		metric = m.metrics[name]
 	}
 
 	metric.(*metrics.HistogramVec).With(metrics.Labels(labels)).Observe(value)
+}
+
+// SetGauge publishes an absolute value for one label set, registering the
+// metric on first use. Unlike the counters here, a gauge must be able to go
+// down and to disappear - see DeleteGauge.
+func (m *metricRecorder) SetGauge(name string, value float64, labels map[string]string) {
+	if m == nil {
+		return // recorder is not initialized
+	}
+
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
+	metric, ok := m.metrics[name]
+	if !ok {
+		klog.V(4).InfoS("Metric not found, registering", "name", name, "labels", labels)
+		m.registerGaugeVec(name, "seconds a (volume, node) pair has been failing to detach, measured from its first failure", getLabelNames(labels))
+		metric = m.metrics[name]
+	}
+
+	metric.(*metrics.GaugeVec).With(metrics.Labels(labels)).Set(value)
+}
+
+// DeleteGauge drops one series. Needed because a recovered volume must stop
+// reporting "stuck for N seconds" - a stale series would alert forever.
+func (m *metricRecorder) DeleteGauge(name string, labels map[string]string) {
+	if m == nil {
+		return // recorder is not initialized
+	}
+
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
+	metric, ok := m.metrics[name]
+	if !ok {
+		return
+	}
+
+	metric.(*metrics.GaugeVec).Delete(metrics.Labels(labels))
 }
 
 // InitializeMetricsHandler starts a new HTTP server to expose the metrics.
@@ -117,6 +160,26 @@ func (m *metricRecorder) registerCounterVec(name, help string, labels []string) 
 	counter := createCounterVec(name, help, labels)
 	m.metrics[name] = counter
 	m.registry.MustRegister(counter)
+}
+
+func (m *metricRecorder) registerGaugeVec(name, help string, labels []string) {
+	if _, exists := m.metrics[name]; exists {
+		return
+	}
+	gauge := createGaugeVec(name, help, labels)
+	m.metrics[name] = gauge
+	m.registry.MustRegister(gauge)
+}
+
+func createGaugeVec(name, help string, labels []string) *metrics.GaugeVec {
+	return metrics.NewGaugeVec(
+		&metrics.GaugeOpts{
+			Name:           name,
+			Help:           help,
+			StabilityLevel: metrics.ALPHA,
+		},
+		labels,
+	)
 }
 
 func createHistogramVec(name, help string, labels []string, buckets []float64) *metrics.HistogramVec {

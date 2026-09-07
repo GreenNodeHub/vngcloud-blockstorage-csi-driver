@@ -16,6 +16,10 @@ type Cloud interface {
 	DeleteVolume(ctx lctx.Context, volID string) lserr.IError
 	AttachVolume(ctx lctx.Context, instanceID, volumeID string) (*lsentity.Volume, lserr.IError)
 	DetachVolume(ctx lctx.Context, instanceID, volumeID string) lserr.IError
+	// IsDetachedFrom reads whether the volume is already off this instance,
+	// without commanding anything. Used while a detach is paused by the
+	// circuit-breaker, so recovery is still noticed promptly.
+	IsDetachedFrom(pctx lctx.Context, pinstanceId, pvolumeId string) (bool, lserr.IError)
 	ModifyVolumeType(ctx lctx.Context, pvolumeId, pvolumeType string, psize int) lserr.IError
 	ResizeOrModifyDisk(ctx lctx.Context, volumeID string, newSizeBytes int64, options *ModifyDiskOptions) (newSize int64, err error)
 	ExpandVolume(ctx lctx.Context, volumeID, volumeTypeID string, newSize uint64) error
