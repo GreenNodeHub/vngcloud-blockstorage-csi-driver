@@ -37,8 +37,15 @@ func InitializeRecorder() *metricRecorder {
 	return r
 }
 
-// IncreaseCount increases the counter metric by 1.
-func (m *metricRecorder) IncreaseCount(name string, labels map[string]string) {
+// IncreaseCount increases the counter metric by 1, registering it on first use
+// with the help string the caller supplies.
+//
+// help is a parameter rather than a default because only the caller knows what
+// the metric means. These methods used to register every counter and histogram
+// with the literal "ebs_csi_aws_com metric", copied from aws-ebs-csi-driver, and
+// the dev cluster duly published that as the description of both operator-facing
+// counters this driver added - naming the wrong cloud and explaining nothing.
+func (m *metricRecorder) IncreaseCount(name, help string, labels map[string]string) {
 	if m == nil {
 		return // recorder is not initialized
 	}
@@ -49,15 +56,17 @@ func (m *metricRecorder) IncreaseCount(name string, labels map[string]string) {
 	metric, ok := m.metrics[name]
 	if !ok {
 		klog.V(4).InfoS("Metric not found, registering", "name", name, "labels", labels)
-		m.registerCounterVec(name, "ebs_csi_aws_com metric", getLabelNames(labels))
+		m.registerCounterVec(name, help, getLabelNames(labels))
 		metric = m.metrics[name]
 	}
 
 	metric.(*metrics.CounterVec).With(metrics.Labels(labels)).Inc()
 }
 
-// ObserveHistogram records the given value in the histogram metric.
-func (m *metricRecorder) ObserveHistogram(name string, value float64, labels map[string]string, buckets []float64) {
+// ObserveHistogram records the given value in the histogram metric, registering
+// it on first use with the caller's help string. See IncreaseCount on why help
+// is a parameter.
+func (m *metricRecorder) ObserveHistogram(name, help string, value float64, labels map[string]string, buckets []float64) {
 	if m == nil {
 		return // recorder is not initialized
 	}
@@ -68,7 +77,7 @@ func (m *metricRecorder) ObserveHistogram(name string, value float64, labels map
 	metric, ok := m.metrics[name]
 	if !ok {
 		klog.V(4).InfoS("Metric not found, registering", "name", name, "labels", labels, "buckets", buckets)
-		m.registerHistogramVec(name, "ebs_csi_aws_com metric", getLabelNames(labels), buckets)
+		m.registerHistogramVec(name, help, getLabelNames(labels), buckets)
 		metric = m.metrics[name]
 	}
 
@@ -76,9 +85,13 @@ func (m *metricRecorder) ObserveHistogram(name string, value float64, labels map
 }
 
 // SetGauge publishes an absolute value for one label set, registering the
-// metric on first use. Unlike the counters here, a gauge must be able to go
-// down and to disappear - see DeleteGauge.
-func (m *metricRecorder) SetGauge(name string, value float64, labels map[string]string) {
+// metric on first use with the caller's help string. Unlike the counters here,
+// a gauge must be able to go down and to disappear - see DeleteGauge.
+//
+// help used to be hard-coded to the detach-pending wording for ANY gauge name,
+// which happened to be right because exactly one gauge existed. The second one
+// would have been published under the first one's description.
+func (m *metricRecorder) SetGauge(name, help string, value float64, labels map[string]string) {
 	if m == nil {
 		return // recorder is not initialized
 	}
@@ -89,7 +102,7 @@ func (m *metricRecorder) SetGauge(name string, value float64, labels map[string]
 	metric, ok := m.metrics[name]
 	if !ok {
 		klog.V(4).InfoS("Metric not found, registering", "name", name, "labels", labels)
-		m.registerGaugeVec(name, "seconds a (volume, node) pair has been failing to detach, measured from its first failure", getLabelNames(labels))
+		m.registerGaugeVec(name, help, getLabelNames(labels))
 		metric = m.metrics[name]
 	}
 

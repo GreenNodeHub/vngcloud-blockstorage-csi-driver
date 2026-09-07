@@ -147,6 +147,16 @@ const (
 	MetricIaaSErrors = "vcontainer_csi_iaas_errors_total"
 )
 
+// Help strings for the metrics above. These are what an operator reads in a
+// dashboard or an alert, so they are declared beside the names they describe
+// and passed in explicitly - the recorder has no way to know what a metric
+// means, and its old default said "ebs_csi_aws_com metric" for every counter.
+const (
+	MetricDetachPendingSecondsHelp = "seconds a (volume, node) pair has been failing to detach, measured from its first failure"
+	MetricDetachBreakerTripsHelp   = "detach circuit-breaker trips and backoff-step increases, by error reason"
+	MetricIaaSErrorsHelp           = "IaaS errors returned to the driver, by operation and classified reason"
+)
+
 // Supported access modes
 const (
 	SingleNodeWriter     = lcsi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER

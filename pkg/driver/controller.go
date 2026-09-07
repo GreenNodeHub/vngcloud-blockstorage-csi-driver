@@ -246,7 +246,7 @@ func (s *controllerService) CreateVolume(pctx lctx.Context, preq *lcsi.CreateVol
 	if sdkErr != nil {
 		llog.ErrorS(sdkErr.GetError(), "[ERROR] - CreateVolume: failed to create volume", "errMsg", sdkErr.GetErrorMessages())
 		cls := lscloud.Classify(sdkErr)
-		lsmetrics.Recorder().IncreaseCount(MetricIaaSErrors, map[string]string{
+		lsmetrics.Recorder().IncreaseCount(MetricIaaSErrors, MetricIaaSErrorsHelp, map[string]string{
 			"op": "create", "reason": cls.Reason,
 		})
 		// A specific reason is what makes this event actionable: "quota
@@ -502,7 +502,7 @@ func (s *controllerService) onDetachFailed(
 
 	// Unconditional: iaas_errors_total is the series that covers failures the
 	// breaker has not opened on yet.
-	lsmetrics.Recorder().IncreaseCount(MetricIaaSErrors, map[string]string{
+	lsmetrics.Recorder().IncreaseCount(MetricIaaSErrors, MetricIaaSErrorsHelp, map[string]string{
 		"op": "detach", "reason": cls.Reason,
 	})
 
@@ -513,7 +513,7 @@ func (s *controllerService) onDetachFailed(
 	// failure stepped it, or it was already open - because Failure has already
 	// updated the entry by the time Since reads it.
 	if isTripped {
-		lsmetrics.Recorder().SetGauge(MetricDetachPendingSeconds, stuck.Seconds(), map[string]string{
+		lsmetrics.Recorder().SetGauge(MetricDetachPendingSeconds, MetricDetachPendingSecondsHelp, stuck.Seconds(), map[string]string{
 			"volume_id": pvolumeID, "node_id": pnodeID,
 		})
 	}
@@ -522,7 +522,7 @@ func (s *controllerService) onDetachFailed(
 		return
 	}
 
-	lsmetrics.Recorder().IncreaseCount(MetricDetachBreakerTrips, map[string]string{
+	lsmetrics.Recorder().IncreaseCount(MetricDetachBreakerTrips, MetricDetachBreakerTripsHelp, map[string]string{
 		"reason": cls.Reason,
 	})
 
