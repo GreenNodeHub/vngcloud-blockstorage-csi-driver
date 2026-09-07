@@ -148,3 +148,34 @@ func TestKeyedMetaCacheSeparatesKeys(t *ltesting.T) {
 		t.Fatalf("3 calls over 2 keys triggered %d fetches, want %d", calls.Load(), want)
 	}
 }
+
+// The portal project id cannot change for the life of a cluster, so its cache
+// must never expire: metaCache.get re-runs the loader once the TTL has lapsed
+// and returns the loader's error, so a TTL lapsing DURING a vServer outage
+// would make every call fail even though a perfectly good id was already known.
+func TestPermanentMetaCacheNeverRefetches(t *ltesting.T) {
+	var calls lsync_atomic.Int32
+	c := newPermanentMetaCache[int]()
+	load := func() (int, lserr.IError) {
+		calls.Add(1)
+		return 42, nil
+	}
+
+	if _, err := c.get(load); err != nil {
+		t.Fatalf("first get() returned error: %v", err)
+	}
+
+	// Wind the clock past any expiry by construction instead of sleeping.
+	c.expires = ltime.Now().Add(-ltime.Hour)
+
+	got, err := c.get(load)
+	if err != nil {
+		t.Fatalf("get() after the expiry lapsed returned error: %v", err)
+	}
+	if got != 42 {
+		t.Fatalf("get() = %v, want the cached 42", got)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("a permanent cache ran the loader %d times, want 1", got)
+	}
+}

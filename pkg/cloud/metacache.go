@@ -29,8 +29,12 @@ type metaCache[T any] struct {
 	mu      lsync.Mutex
 	ttl     ltime.Duration
 	value   T
+	loaded  bool
 	expires ltime.Time
 	loading *metaCacheCall[T]
+
+	// permanent drops the expiry entirely - see newPermanentMetaCache.
+	permanent bool
 }
 
 // metaCacheCall is one in-flight fetch that late callers wait on.
@@ -44,10 +48,26 @@ func newMetaCache[T any](pttl ltime.Duration) *metaCache[T] {
 	return &metaCache[T]{ttl: pttl}
 }
 
+// newPermanentMetaCache memoises a value that cannot change for the life of
+// the process, keeping the single-flight behaviour and the "never cache a
+// failure" rule.
+//
+// Re-running the loader is not a cheap refresh here: get returns the loader's
+// error, so an expiry lapsing while vServer is unreachable would fail calls
+// that a value already in hand could have served.
+func newPermanentMetaCache[T any]() *metaCache[T] {
+	return &metaCache[T]{permanent: true}
+}
+
+// fresh reports whether the cached value may still be served. Callers hold mu.
+func (s *metaCache[T]) fresh() bool {
+	return s.loaded && (s.permanent || ltime.Now().Before(s.expires))
+}
+
 func (s *metaCache[T]) get(pload func() (T, lserr.IError)) (T, lserr.IError) {
 	s.mu.Lock()
 
-	if ltime.Now().Before(s.expires) {
+	if s.fresh() {
 		value := s.value
 		s.mu.Unlock()
 
@@ -73,6 +93,7 @@ func (s *metaCache[T]) get(pload func() (T, lserr.IError)) (T, lserr.IError) {
 	s.loading = nil
 	if call.err == nil {
 		s.value = call.value
+		s.loaded = true
 		s.expires = ltime.Now().Add(s.ttl)
 	}
 	s.mu.Unlock()
