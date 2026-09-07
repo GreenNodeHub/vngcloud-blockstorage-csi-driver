@@ -29,3 +29,9 @@ TestResults.xml
 # Local GOPATH: the Makefile defaults GOPATH to $(PWD)/.go, so a module cache
 # lands in the repo root and can be committed by accident.
 .go/
+
+# Planning and design docs live with whoever is doing the work, not in the
+# repo. The superpowers workflow writes specs and plans under docs/, and those
+# are scratch for one change - they go stale the moment the code lands and
+# would otherwise be reviewed as if they were still true.
+docs/
