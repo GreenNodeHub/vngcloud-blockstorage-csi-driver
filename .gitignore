@@ -25,3 +25,7 @@ TestResults.xml
 
 # macOS
 .DS_Store
+
+# Local GOPATH: the Makefile defaults GOPATH to $(PWD)/.go, so a module cache
+# lands in the repo root and can be committed by accident.
+.go/
