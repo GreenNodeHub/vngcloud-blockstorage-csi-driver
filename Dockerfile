@@ -28,8 +28,33 @@ ARG DISTROLESS_IMAGE=registry.k8s.io/build-image/go-runner:v2.3.1-go1.22-bookwor
 # images
 ARG ALPINE_IMAGE=alpine:3.17.5
 
-# vngcloud-blockstorage-csi-driver uses Debian as a base image
-ARG DEBIAN_IMAGE=registry.k8s.io/build-image/debian-base:bullseye-v1.4.3
+# vngcloud-blockstorage-csi-driver uses Debian as a base image.
+#
+# bookworm, not bullseye: on 07/09/2026 the dev image build failed on
+# "404 Not Found" for e2fsprogs_1.46.2-2+deb11u1_amd64.deb. The package was
+# never gone - the same URL with a literal '+' returned 200 throughout, while
+# the percent-encoded form apt actually sends (%2b) 404'd. Measured over a
+# 15-file sample per suite, all fetched twice (%2b and %2B):
+#
+#   bullseye main        0/15 failed
+#   bullseye-security    6/15 failed   <-- only this one
+#   bookworm main        0/15 failed
+#   bookworm-security    0/15 failed
+#
+# So the fault is confined to the bullseye-security archive, which is now
+# oldoldstable-security. Every apt install of a +debNuM package from it is a
+# coin flip, which is why the build had been green until now and then was not.
+# Pinning package versions cannot help - the URL apt constructs is what breaks.
+#
+# Moving to bookworm also removes a mismatch that had been working by luck:
+# DISTROLESS_IMAGE below is already bookworm-based, so the utils stage was
+# copying bullseye libraries into a bookworm runtime.
+#
+# Verified before the bump, without building: all 19 explicit paths in
+# tools/csi-deps.sh, and every path its four wildcard copies expand to, exist
+# in the bookworm versions of the eight packages installed at the utils stage.
+# The utils-check stage remains the real gate.
+ARG DEBIAN_IMAGE=registry.k8s.io/build-image/debian-base:bookworm-v1.0.8
 
 ################################################################################
 ##                              BUILD STAGE                                   ##
