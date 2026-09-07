@@ -19,6 +19,7 @@ const (
 	ReasonVolumeInErrorState        = "VolumeInErrorState"
 	ReasonIaaSThrottled             = "IaaSThrottled"
 	ReasonIaaSServerError           = "IaaSServerError"
+	ReasonIaaSUnreachable           = "IaaSUnreachable"
 	ReasonIaaSOperationStalled      = "IaaSOperationStalled"
 	ReasonIaaSUnknownError          = "IaaSUnknownError"
 )
@@ -100,6 +101,34 @@ func Classify(perr lserr.IError) Class {
 		// psdkErr == nil, meaning the IaaS ACCEPTED the detach and the volume
 		// then never finished. That is exactly the 23-hour incident's error.
 		return Class{Reason: ReasonIaaSOperationStalled}
+	case code == lsdkErrs.EcUnexpectedError:
+		// The SDK's catch-all, and by volume the most common IaaS failure there
+		// is: sdk_error/common.go:164 stamps it on every transport-level
+		// problem - connection refused, DNS failure, the 120s client timeout -
+		// as well as on any response whose status it does not recognise.
+		//
+		// TS-G on 07/09/2026 dropped vServer egress and watched every event and
+		// both metrics come back reason="IaaSUnknownError", for op=create as
+		// well as op=detach, because this code was unmapped. The classifier
+		// looked like it worked and reported nothing useful about the failure
+		// operators are most likely to hit.
+		//
+		// statusCode is the discriminator the SDK leaves behind: it is 0 when no
+		// response ever arrived. Nothing about the volume's state is knowable in
+		// that case, so this is NOT ReasonIaaSOperationStalled, which the spec
+		// suggested - "stalled" claims the IaaS accepted the operation and is
+		// working on it, and here the request never landed.
+		if hasServerErrorStatus(perr) {
+			return Class{Reason: ReasonIaaSServerError}
+		}
+		if !hasResponseStatus(perr) {
+			return Class{Reason: ReasonIaaSUnreachable}
+		}
+		// A response arrived with a status that is neither 5xx nor one of the
+		// codes handled above - a 4xx we do not model. Retrying it unchanged
+		// will not help, but it stays non-terminal: calling a transient error
+		// terminal is the more expensive mistake.
+		return Class{Reason: ReasonIaaSUnknownError}
 	}
 
 	// EcVServerVolumeFailedToGet is deliberately left to fall through to
@@ -126,6 +155,32 @@ func effectiveCode(perr lserr.IError) lsdkErrs.ErrorCode {
 	}
 
 	return perr.GetErrorCode()
+}
+
+// hasResponseStatus reports whether a response actually came back. The SDK
+// records statusCode 0 when the request never reached a server, so a missing or
+// zero value means "no round trip completed", not "status unknown".
+func hasResponseStatus(perr lserr.IError) bool {
+	raw, ok := perr.GetParameters()["statusCode"]
+	if !ok {
+		return false
+	}
+
+	status, ok := raw.(int)
+
+	return ok && status != 0
+}
+
+// hasServerErrorStatus reports whether the response that did arrive was a 5xx.
+func hasServerErrorStatus(perr lserr.IError) bool {
+	raw, ok := perr.GetParameters()["statusCode"]
+	if !ok {
+		return false
+	}
+
+	status, ok := raw.(int)
+
+	return ok && status >= lhttp.StatusInternalServerError
 }
 
 // isThrottledStatus reads the raw statusCode the SDK stashes in the error
