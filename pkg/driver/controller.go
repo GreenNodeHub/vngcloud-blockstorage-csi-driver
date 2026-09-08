@@ -100,6 +100,7 @@ func (s *controllerService) CreateVolume(pctx lctx.Context, preq *lcsi.CreateVol
 	listZones, serr := s.cloud.GetListZones()
 	if serr != nil {
 		llog.ErrorS(serr.GetError(), "[ERROR] - CreateVolume: Failed to list availability zones")
+		s.reportCreateIaaSError(pctx, preq, serr)
 		return nil, serr.GetError()
 	}
 	availabilityZone := pickAvailabilityZone(preq.GetAccessibilityRequirements())
@@ -114,7 +115,7 @@ func (s *controllerService) CreateVolume(pctx lctx.Context, preq *lcsi.CreateVol
 	llog.V(5).InfoS("[INFO] - CreateVolume: availability zone", "portalZone", portalZone)
 
 	// Validate volume size, if volume size is less than the default volume size of cloud provider, set it to the default volume size
-	volumeTypeId, volSizeBytes, err := s.getVolSizeBytes(portalZone, preq)
+	volumeTypeId, volSizeBytes, err := s.getVolSizeBytes(pctx, portalZone, preq)
 	if err != nil {
 		llog.ErrorS(err, "[ERROR] - CreateVolume: Failed to get volume size")
 		return nil, ErrFailedToValidateVolumeSize(preq.GetName(), err)
@@ -144,8 +145,11 @@ func (s *controllerService) CreateVolume(pctx lctx.Context, preq *lcsi.CreateVol
 	defer s.createGate.Release()
 
 	if _, serr = s.cloud.GetVolumeByName(volName); serr != nil {
+		// EcVServerVolumeNotFound is the answer this call is looking for, not
+		// a failure, so only the other codes are reported.
 		if !serr.IsError(lsdkErrs.EcVServerVolumeNotFound) {
 			llog.ErrorS(serr.GetError(), "[ERROR] - CreateVolume: Failed to get volume", "volumeName", volName)
+			s.reportCreateIaaSError(pctx, preq, serr)
 			return nil, ErrFailedToListVolumeByName(volName)
 		}
 	}
@@ -245,20 +249,40 @@ func (s *controllerService) CreateVolume(pctx lctx.Context, preq *lcsi.CreateVol
 	newVol, sdkErr := s.cloud.EitherCreateResizeVolume(cvr.ToSdkCreateVolumeRequest())
 	if sdkErr != nil {
 		llog.ErrorS(sdkErr.GetError(), "[ERROR] - CreateVolume: failed to create volume", "errMsg", sdkErr.GetErrorMessages())
-		cls := lscloud.Classify(sdkErr)
-		lsmetrics.Recorder().IncreaseCount(MetricIaaSErrors, MetricIaaSErrorsHelp, map[string]string{
-			"op": "create", "reason": cls.Reason,
-		})
-		// A specific reason is what makes this event actionable: "quota
-		// exhausted" needs a human, "throttled" resolves itself.
-		s.k8sClient.PersistentVolumeClaimEventWarning(pctx, cvr.PvcNamespaceTag, cvr.PvcNameTag,
-			cls.Reason, sdkErr.GetMessage())
+		s.reportCreateIaaSError(pctx, preq, sdkErr)
 		return nil, sdkErr.GetError()
 	}
 
 	s.k8sClient.PersistentVolumeClaimEventNormal(pctx, cvr.PvcNamespaceTag, cvr.PvcNameTag,
 		"CsiCreateVolumeSuccess", lfmt.Sprintf("Volume created successfully with ID %s for PersistentVolume %s", newVol.Id, newVol.Name))
 	return newCreateVolumeResponse(newVol, availabilityZone, cvr, respCtx), nil
+}
+
+// reportCreateIaaSError publishes the two operator-facing halves of one IaaS
+// failure on the create path: the op="create" series of MetricIaaSErrors and a
+// Warning on the PVC named after the classified reason.
+//
+// A specific reason is what makes the event actionable: "quota exhausted"
+// needs a human, "throttled" resolves itself.
+//
+// The PVC coordinates come from the request parameters, not from cvr, because
+// most of the create path's IaaS calls happen before cvr is built. Both carry
+// the same two values - cvr copies them out of these parameters.
+//
+// Observability never fails the caller: this returns nothing, and the event
+// and metric sinks each swallow their own errors.
+func (s *controllerService) reportCreateIaaSError(pctx lctx.Context, preq *lcsi.CreateVolumeRequest, pierr lserr.IError) {
+	if pierr == nil {
+		return
+	}
+
+	cls := lscloud.Classify(pierr)
+	lsmetrics.Recorder().IncreaseCount(MetricIaaSErrors, MetricIaaSErrorsHelp, map[string]string{
+		"op": "create", "reason": cls.Reason,
+	})
+
+	ns, name := getCreateVolumeRequestNamespacedName(preq)
+	s.k8sClient.PersistentVolumeClaimEventWarning(pctx, ns, name, cls.Reason, pierr.GetMessage())
 }
 
 // pickAvailabilityZone selects 1 zone given topology requirement.
@@ -907,7 +931,10 @@ func (s *controllerService) getClusterID() string {
 	return s.driverOptions.clusterID
 }
 
-func (s *controllerService) getVolSizeBytes(zoneID string, preq *lcsi.CreateVolumeRequest) (volumeTypeId string, volSizeBytes int64, err error) {
+// getVolSizeBytes takes pctx only so the three IaaS lookups below can report
+// their own failures - each of them used to discard the lserr.IError with
+// GetError(), which threw away the only thing the classifier can read.
+func (s *controllerService) getVolSizeBytes(pctx lctx.Context, zoneID string, preq *lcsi.CreateVolumeRequest) (volumeTypeId string, volSizeBytes int64, err error) {
 	// get the volume size that user provided
 	if preq.GetCapacityRange() != nil {
 		volSizeBytes = preq.GetCapacityRange().GetRequiredBytes()
@@ -919,6 +946,7 @@ func (s *controllerService) getVolSizeBytes(zoneID string, preq *lcsi.CreateVolu
 		// If the user forget to specify the volume type, get the default volume type
 		tmpVolType, sdkErr := s.cloud.GetDefaultVolumeType()
 		if sdkErr != nil {
+			s.reportCreateIaaSError(pctx, preq, sdkErr)
 			return "", 0, sdkErr.GetError()
 		}
 
@@ -926,18 +954,24 @@ func (s *controllerService) getVolSizeBytes(zoneID string, preq *lcsi.CreateVolu
 	}
 	volumeTypeId, sdkErr := s.cloud.GetVolumeTypeIdByName(zoneID, volType)
 	if sdkErr != nil {
+		s.reportCreateIaaSError(pctx, preq, sdkErr)
 		return "", 0, sdkErr.GetError()
 	}
 
 	// Get the minimum volume size allowed by the volume type
 	volTypeEntity, sdkErr := s.cloud.GetVolumeTypeById(volumeTypeId)
 	if sdkErr != nil {
+		s.reportCreateIaaSError(pctx, preq, sdkErr)
 		return "", 0, sdkErr.GetError()
 	}
 
 	// Calculate the bytes that cloud provider allowing to create the volume
 	cvs := lsutil.GiBToBytes(int64(volTypeEntity.MinSize))
 	if volSizeBytes < cvs {
+		// Deliberately NOT reported through reportCreateIaaSError: the IaaS
+		// answered fine, the request asked for too little. Counting it as an
+		// IaaS error would charge a user mistake to the operator's IaaS error
+		// budget and point the reason label at the wrong subsystem.
 		return volumeTypeId, 0, ErrVolumeSizeTooSmall(preq.GetName(), volSizeBytes)
 	}
 
