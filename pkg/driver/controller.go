@@ -364,6 +364,8 @@ func (s *controllerService) ControllerPublishVolume(pctx lctx.Context, preq *lcs
 	_, ierr := s.cloud.AttachVolume(pctx, nodeID, volumeID)
 	if ierr != nil {
 		llog.ErrorS(ierr.GetError(), "[ERROR] - ControllerPublishVolume; failed to attach volume to instance", "volumeID", volumeID, "nodeID", nodeID)
+		s.reportAttachIaaSError(pctx, volumeID, nodeID, ierr)
+
 		return nil, ErrAttachVolume(volumeID, nodeID)
 	}
 
@@ -560,6 +562,42 @@ func (s *controllerService) onDetachSucceeded(
 	msg := lfmt.Sprintf("Detach %s from %s succeeded after being stuck for %s.",
 		pvolumeID, pnodeID, stuck.Round(ltime.Second))
 	s.emitVolumeEvent(pctx, pvolumeID, lcoreV1.EventTypeNormal, "VolumeDetachRecovered", msg)
+}
+
+// reportAttachIaaSError gives a failed attach a reason an operator can act on.
+//
+// F9, measured on the dev cluster: the driver reported CSINode
+// allocatable.count = 10, the scheduler saw 8 in use and placed another pod,
+// and the IaaS refused the attach because an orphaned volume already held the
+// last slot. The pod sat Pending forever retrying FailedAttachVolume while the
+// scheduler never reported "no capacity" - and the driver said nothing that
+// distinguished a full node from any other attach failure.
+//
+// Classify already mapped EcVServerServerVolumeAttachQuotaExceeded to
+// ReasonVolumeAttachQuotaExceeded; nothing on this path had ever called it.
+//
+// This deliberately does NOT pre-check capacity or change the gRPC code.
+// Upstream aws-ebs-csi-driver does no pre-check either and relies on reporting
+// the condition distinctly; and the code this path returns decides what
+// external-attacher does next, which is not provable from source here because
+// the attacher is not vendored. Reporting is additive and safe. Whether
+// codes.ResourceExhausted is the better answer is a separate question that
+// needs a live experiment, exactly like the Internal-vs-Aborted question on
+// the detach path.
+func (s *controllerService) reportAttachIaaSError(pctx lctx.Context, pvolumeID, pnodeID string, pierr lserr.IError) {
+	if pierr == nil {
+		return
+	}
+
+	cls := lscloud.Classify(pierr)
+	lsmetrics.Recorder().IncreaseCount(MetricIaaSErrors, MetricIaaSErrorsHelp, map[string]string{
+		"op": "attach", "reason": cls.Reason,
+	})
+
+	// The reason field already carries the classification. Repeating it in the
+	// body made a Contains-based test pass even with a generic reason field.
+	msg := lfmt.Sprintf("Attach %s to %s failed: %s", pvolumeID, pnodeID, pierr.GetMessage())
+	s.emitVolumeEvent(pctx, pvolumeID, lcoreV1.EventTypeWarning, cls.Reason, msg)
 }
 
 // emitVolumeEvent resolves the IaaS volume ID to its PV and emits there (and on
