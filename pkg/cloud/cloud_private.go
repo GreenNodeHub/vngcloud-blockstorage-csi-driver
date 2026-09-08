@@ -26,9 +26,14 @@ func (s *cloud) getVolumeByName(pvolName string) (*lsdkEntity.Volume, lserr.IErr
 		return nil, new(lsdkErrs.SdkError).WithErrorCode(lsdkErrs.EcVServerVolumeNotFound)
 	}
 
+	client, ierr := s.projectClient()
+	if ierr != nil {
+		return nil, ierr
+	}
+
 	// Get the volume depends on name
 	opts := lsdkVolume.NewListBlockVolumesRequest(1, 10).WithName(pvolName)
-	vols, sdkErr := s.client.VServerGateway().V2().VolumeService().ListBlockVolumes(opts)
+	vols, sdkErr := client.VServerGateway().V2().VolumeService().ListBlockVolumes(opts)
 	if sdkErr != nil {
 		return nil, lserr.NewError(sdkErr)
 	}
@@ -43,9 +48,14 @@ func (s *cloud) getVolumeByName(pvolName string) (*lsdkEntity.Volume, lserr.IErr
 }
 
 func (s *cloud) getVolumeById(pvolId string) (*lsdkEntity.Volume, lserr.IError) {
+	client, ierr := s.projectClient()
+	if ierr != nil {
+		return nil, ierr
+	}
+
 	// Get the volume depends on id
 	opts := lsdkVolume.NewGetBlockVolumeByIdRequest(pvolId)
-	vol, sdkErr := s.client.VServerGateway().V2().VolumeService().GetBlockVolumeById(opts)
+	vol, sdkErr := client.VServerGateway().V2().VolumeService().GetBlockVolumeById(opts)
 	if sdkErr != nil {
 		return nil, lserr.NewError(sdkErr)
 	}
