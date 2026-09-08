@@ -11,13 +11,13 @@ func TestSetGaugeThenDelete(t *ltesting.T) {
 	r := InitializeRecorder()
 	labels := map[string]string{"volume_id": "vol-1", "node_id": "ins-1"}
 
-	r.SetGauge("vcontainer_csi_test_pending_seconds", 42, labels)
+	r.SetGauge("vcontainer_csi_test_pending_seconds", "test gauge help", 42, labels)
 	if got := gaugeValue(t, r, "vcontainer_csi_test_pending_seconds", labels); got != 42 {
 		t.Fatalf("gauge = %v, want 42", got)
 	}
 
 	// Overwriting the same series must replace, not accumulate.
-	r.SetGauge("vcontainer_csi_test_pending_seconds", 100, labels)
+	r.SetGauge("vcontainer_csi_test_pending_seconds", "test gauge help", 100, labels)
 	if got := gaugeValue(t, r, "vcontainer_csi_test_pending_seconds", labels); got != 100 {
 		t.Fatalf("gauge after re-set = %v, want 100", got)
 	}
@@ -36,8 +36,8 @@ func TestSetGaugeIsIdempotentOnRegistration(t *ltesting.T) {
 	r := InitializeRecorder()
 	labels := map[string]string{"volume_id": "vol-1", "node_id": "ins-1"}
 
-	r.SetGauge("vcontainer_csi_test_twice", 1, labels)
-	r.SetGauge("vcontainer_csi_test_twice", 2, labels)
+	r.SetGauge("vcontainer_csi_test_twice", "test gauge help", 1, labels)
+	r.SetGauge("vcontainer_csi_test_twice", "test gauge help", 2, labels)
 
 	if got := gaugeValue(t, r, "vcontainer_csi_test_twice", labels); got != 2 {
 		t.Fatalf("gauge = %v, want 2", got)
@@ -59,7 +59,7 @@ func TestSetGaugeConcurrentFirstUse(t *ltesting.T) {
 	for i := 0; i < n; i++ {
 		go func(i int) {
 			defer wg.Done()
-			r.SetGauge(name, float64(i), labels)
+			r.SetGauge(name, "test gauge help", float64(i), labels)
 		}(i)
 	}
 	wg.Wait()
