@@ -245,20 +245,40 @@ func (s *controllerService) CreateVolume(pctx lctx.Context, preq *lcsi.CreateVol
 	newVol, sdkErr := s.cloud.EitherCreateResizeVolume(cvr.ToSdkCreateVolumeRequest())
 	if sdkErr != nil {
 		llog.ErrorS(sdkErr.GetError(), "[ERROR] - CreateVolume: failed to create volume", "errMsg", sdkErr.GetErrorMessages())
-		cls := lscloud.Classify(sdkErr)
-		lsmetrics.Recorder().IncreaseCount(MetricIaaSErrors, MetricIaaSErrorsHelp, map[string]string{
-			"op": "create", "reason": cls.Reason,
-		})
-		// A specific reason is what makes this event actionable: "quota
-		// exhausted" needs a human, "throttled" resolves itself.
-		s.k8sClient.PersistentVolumeClaimEventWarning(pctx, cvr.PvcNamespaceTag, cvr.PvcNameTag,
-			cls.Reason, sdkErr.GetMessage())
+		s.reportCreateIaaSError(pctx, preq, sdkErr)
 		return nil, sdkErr.GetError()
 	}
 
 	s.k8sClient.PersistentVolumeClaimEventNormal(pctx, cvr.PvcNamespaceTag, cvr.PvcNameTag,
 		"CsiCreateVolumeSuccess", lfmt.Sprintf("Volume created successfully with ID %s for PersistentVolume %s", newVol.Id, newVol.Name))
 	return newCreateVolumeResponse(newVol, availabilityZone, cvr, respCtx), nil
+}
+
+// reportCreateIaaSError publishes the two operator-facing halves of one IaaS
+// failure on the create path: the op="create" series of MetricIaaSErrors and a
+// Warning on the PVC named after the classified reason.
+//
+// A specific reason is what makes the event actionable: "quota exhausted"
+// needs a human, "throttled" resolves itself.
+//
+// The PVC coordinates come from the request parameters, not from cvr, because
+// most of the create path's IaaS calls happen before cvr is built. Both carry
+// the same two values - cvr copies them out of these parameters.
+//
+// Observability never fails the caller: this returns nothing, and the event
+// and metric sinks each swallow their own errors.
+func (s *controllerService) reportCreateIaaSError(pctx lctx.Context, preq *lcsi.CreateVolumeRequest, pierr lserr.IError) {
+	if pierr == nil {
+		return
+	}
+
+	cls := lscloud.Classify(pierr)
+	lsmetrics.Recorder().IncreaseCount(MetricIaaSErrors, MetricIaaSErrorsHelp, map[string]string{
+		"op": "create", "reason": cls.Reason,
+	})
+
+	ns, name := getCreateVolumeRequestNamespacedName(preq)
+	s.k8sClient.PersistentVolumeClaimEventWarning(pctx, ns, name, cls.Reason, pierr.GetMessage())
 }
 
 // pickAvailabilityZone selects 1 zone given topology requirement.
