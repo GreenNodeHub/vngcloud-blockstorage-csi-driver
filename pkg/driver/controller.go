@@ -100,6 +100,7 @@ func (s *controllerService) CreateVolume(pctx lctx.Context, preq *lcsi.CreateVol
 	listZones, serr := s.cloud.GetListZones()
 	if serr != nil {
 		llog.ErrorS(serr.GetError(), "[ERROR] - CreateVolume: Failed to list availability zones")
+		s.reportCreateIaaSError(pctx, preq, serr)
 		return nil, serr.GetError()
 	}
 	availabilityZone := pickAvailabilityZone(preq.GetAccessibilityRequirements())
@@ -114,7 +115,7 @@ func (s *controllerService) CreateVolume(pctx lctx.Context, preq *lcsi.CreateVol
 	llog.V(5).InfoS("[INFO] - CreateVolume: availability zone", "portalZone", portalZone)
 
 	// Validate volume size, if volume size is less than the default volume size of cloud provider, set it to the default volume size
-	volumeTypeId, volSizeBytes, err := s.getVolSizeBytes(portalZone, preq)
+	volumeTypeId, volSizeBytes, err := s.getVolSizeBytes(pctx, portalZone, preq)
 	if err != nil {
 		llog.ErrorS(err, "[ERROR] - CreateVolume: Failed to get volume size")
 		return nil, ErrFailedToValidateVolumeSize(preq.GetName(), err)
@@ -144,8 +145,11 @@ func (s *controllerService) CreateVolume(pctx lctx.Context, preq *lcsi.CreateVol
 	defer s.createGate.Release()
 
 	if _, serr = s.cloud.GetVolumeByName(volName); serr != nil {
+		// EcVServerVolumeNotFound is the answer this call is looking for, not
+		// a failure, so only the other codes are reported.
 		if !serr.IsError(lsdkErrs.EcVServerVolumeNotFound) {
 			llog.ErrorS(serr.GetError(), "[ERROR] - CreateVolume: Failed to get volume", "volumeName", volName)
+			s.reportCreateIaaSError(pctx, preq, serr)
 			return nil, ErrFailedToListVolumeByName(volName)
 		}
 	}
@@ -889,7 +893,10 @@ func (s *controllerService) getClusterID() string {
 	return s.driverOptions.clusterID
 }
 
-func (s *controllerService) getVolSizeBytes(zoneID string, preq *lcsi.CreateVolumeRequest) (volumeTypeId string, volSizeBytes int64, err error) {
+// getVolSizeBytes takes pctx only so the three IaaS lookups below can report
+// their own failures - each of them used to discard the lserr.IError with
+// GetError(), which threw away the only thing the classifier can read.
+func (s *controllerService) getVolSizeBytes(pctx lctx.Context, zoneID string, preq *lcsi.CreateVolumeRequest) (volumeTypeId string, volSizeBytes int64, err error) {
 	// get the volume size that user provided
 	if preq.GetCapacityRange() != nil {
 		volSizeBytes = preq.GetCapacityRange().GetRequiredBytes()
@@ -901,6 +908,7 @@ func (s *controllerService) getVolSizeBytes(zoneID string, preq *lcsi.CreateVolu
 		// If the user forget to specify the volume type, get the default volume type
 		tmpVolType, sdkErr := s.cloud.GetDefaultVolumeType()
 		if sdkErr != nil {
+			s.reportCreateIaaSError(pctx, preq, sdkErr)
 			return "", 0, sdkErr.GetError()
 		}
 
@@ -908,18 +916,24 @@ func (s *controllerService) getVolSizeBytes(zoneID string, preq *lcsi.CreateVolu
 	}
 	volumeTypeId, sdkErr := s.cloud.GetVolumeTypeIdByName(zoneID, volType)
 	if sdkErr != nil {
+		s.reportCreateIaaSError(pctx, preq, sdkErr)
 		return "", 0, sdkErr.GetError()
 	}
 
 	// Get the minimum volume size allowed by the volume type
 	volTypeEntity, sdkErr := s.cloud.GetVolumeTypeById(volumeTypeId)
 	if sdkErr != nil {
+		s.reportCreateIaaSError(pctx, preq, sdkErr)
 		return "", 0, sdkErr.GetError()
 	}
 
 	// Calculate the bytes that cloud provider allowing to create the volume
 	cvs := lsutil.GiBToBytes(int64(volTypeEntity.MinSize))
 	if volSizeBytes < cvs {
+		// Deliberately NOT reported through reportCreateIaaSError: the IaaS
+		// answered fine, the request asked for too little. Counting it as an
+		// IaaS error would charge a user mistake to the operator's IaaS error
+		// budget and point the reason label at the wrong subsystem.
 		return volumeTypeId, 0, ErrVolumeSizeTooSmall(preq.GetName(), volSizeBytes)
 	}
 
