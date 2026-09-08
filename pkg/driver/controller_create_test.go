@@ -189,3 +189,86 @@ func TestCreateVolumeReportsClassifiedReasonWhenCreateFails(t *ltesting.T) {
 
 	assertWarningWithReason(t, events, lscloud.ReasonVolumeQuotaExceeded)
 }
+
+type listZonesFailCloud struct {
+	createHappyCloud
+}
+
+func (listZonesFailCloud) GetListZones() (*lsentity.ListZones, lserr.IError) {
+	return nil, unreachableIaaSError()
+}
+
+// The failure the dev cluster actually showed on 08/09/2026 once vServer
+// egress was blocked: this is the first IaaS call on the create path.
+func TestCreateVolumeReportsClassifiedReasonWhenListZonesFails(t *ltesting.T) {
+	svc, events := newCreateTestService(listZonesFailCloud{})
+
+	if _, err := svc.CreateVolume(lctx.Background(), createRequest(20*createTestGiB)); err == nil {
+		t.Fatal("CreateVolume() = nil error, want the list-zones failure")
+	}
+
+	assertWarningWithReason(t, events, lscloud.ReasonIaaSUnreachable)
+}
+
+type volumeTypeFailCloud struct {
+	createHappyCloud
+}
+
+func (volumeTypeFailCloud) GetVolumeTypeIdByName(_, _ string) (string, lserr.IError) {
+	return "", unreachableIaaSError()
+}
+
+// getVolSizeBytes used to discard the IError with GetError(), which threw away
+// the only thing the classifier can read.
+func TestCreateVolumeReportsClassifiedReasonWhenVolumeTypeLookupFails(t *ltesting.T) {
+	svc, events := newCreateTestService(volumeTypeFailCloud{})
+
+	if _, err := svc.CreateVolume(lctx.Background(), createRequest(20*createTestGiB)); err == nil {
+		t.Fatal("CreateVolume() = nil error, want the volume-type lookup failure")
+	}
+
+	assertWarningWithReason(t, events, lscloud.ReasonIaaSUnreachable)
+}
+
+type getVolumeByNameFailCloud struct {
+	createHappyCloud
+}
+
+func (getVolumeByNameFailCloud) GetVolumeByName(_ string) (*lsentity.Volume, lserr.IError) {
+	return nil, unreachableIaaSError()
+}
+
+func TestCreateVolumeReportsClassifiedReasonWhenGetVolumeByNameFails(t *ltesting.T) {
+	svc, events := newCreateTestService(getVolumeByNameFailCloud{})
+
+	if _, err := svc.CreateVolume(lctx.Background(), createRequest(20*createTestGiB)); err == nil {
+		t.Fatal("CreateVolume() = nil error, want the get-by-name failure")
+	}
+
+	assertWarningWithReason(t, events, lscloud.ReasonIaaSUnreachable)
+}
+
+// A requested size below the volume type's minimum is a request-validation
+// failure, not an IaaS one. Reporting it as an IaaS error would charge a user
+// mistake to the operator's IaaS error budget and point the reason label at
+// the wrong subsystem, so getVolSizeBytes must return that one unreported.
+func TestCreateVolumeDoesNotReportTooSmallSizeAsAnIaaSError(t *ltesting.T) {
+	svc, events := newCreateTestService(createHappyCloud{})
+
+	if _, err := svc.CreateVolume(lctx.Background(), createRequest(1*createTestGiB)); err == nil {
+		t.Fatal("CreateVolume() = nil error, want the too-small size failure")
+	}
+
+	for _, msg := range drainEvents(events) {
+		for _, reason := range []string{
+			lscloud.ReasonIaaSUnreachable,
+			lscloud.ReasonIaaSUnknownError,
+			lscloud.ReasonVolumeQuotaExceeded,
+			lscloud.ReasonVolumeSizeQuotaExceeded,
+		} {
+			if lstr.Contains(msg, reason) {
+				t.Fatalf("a too-small requested size produced an IaaS-classified event: %q", msg)
+			}
+		}
+	}
+}
