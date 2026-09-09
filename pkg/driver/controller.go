@@ -644,7 +644,7 @@ func (s *controllerService) emitVolumeEvent(pctx lctx.Context, pvolumeID, pevent
 	s.k8sClient.VolumeEventWarning(pctx, pv.PersistentVolume.Name, preason, pmessage)
 }
 
-func (s *controllerService) CreateSnapshot(_ lctx.Context, preq *lcsi.CreateSnapshotRequest) (*lcsi.CreateSnapshotResponse, error) {
+func (s *controllerService) CreateSnapshot(pctx lctx.Context, preq *lcsi.CreateSnapshotRequest) (*lcsi.CreateSnapshotResponse, error) {
 	llog.V(4).InfoS("[INFO] - CreateSnapshot: called", "preq", *preq)
 	if err := validateCreateSnapshotRequest(preq); err != nil {
 		llog.ErrorS(err, "CreateSnapshot: invalid request")
@@ -660,7 +660,7 @@ func (s *controllerService) CreateSnapshot(_ lctx.Context, preq *lcsi.CreateSnap
 	}
 	defer s.inFlight.Delete(snapshotName)
 
-	snapshot, err := s.cloud.GetVolumeSnapshotByName(volumeID, snapshotName)
+	snapshot, err := s.cloud.GetVolumeSnapshotByName(pctx, volumeID, snapshotName)
 	if err != nil {
 		if !lerr.Is(err, lscloud.ErrSnapshotNotFound) {
 			llog.ErrorS(err, "Error looking for the snapshot", "snapshotName", snapshotName)
@@ -672,7 +672,7 @@ func (s *controllerService) CreateSnapshot(_ lctx.Context, preq *lcsi.CreateSnap
 		return newCreateSnapshotResponse(snapshot)
 	}
 
-	snapshot, err = s.cloud.CreateSnapshotFromVolume(s.getClusterID(), volumeID, snapshotName)
+	snapshot, err = s.cloud.CreateSnapshotFromVolume(pctx, s.getClusterID(), volumeID, snapshotName)
 	if err != nil {
 		llog.ErrorS(err, "CreateSnapshot: Error creating snapshot", "snapshotName", snapshotName, "volumeID", volumeID)
 		return nil, err

@@ -547,28 +547,76 @@ func (s *cloud) GetDeviceDiskID(pvolID string) (string, error) {
 	return vol.UnderId, nil
 }
 
-func (s *cloud) GetVolumeSnapshotByName(pvolID, psnapshotName string) (*lsentity.Snapshot, error) {
+// GetVolumeSnapshotByName is the idempotency check on the create path, so a
+// snapshot it fails to find is a snapshot the driver creates a second time.
+// It used to ask for page 1 of ten and ignore the rest, which on a volume with
+// more than ten snapshots reported ErrSnapshotNotFound for a snapshot that
+// exists - once every retry, each one a duplicate against a shared project
+// quota.
+//
+// The walk ends on the first match, at the page count the server reports, at a
+// short or empty page, or at snapshotListMaxPages, whichever comes first. It
+// ends on pctx too: this runs inside waitSnapshotActive, whose caller gives up
+// after 15 seconds.
+func (s *cloud) GetVolumeSnapshotByName(pctx lctx.Context, pvolID, psnapshotName string) (*lsentity.Snapshot, error) {
 	client, ierr := s.projectClient()
 	if ierr != nil {
 		return nil, ierr.GetError()
 	}
 
-	opt := lsdkVolumeV2.NewListSnapshotsByBlockVolumeIdRequest(1, 10, pvolID)
-	res, err := client.VServerGateway().V2().VolumeService().ListSnapshotsByBlockVolumeId(opt)
-	if err != nil {
-		return nil, err.GetError()
-	}
+	volumeService := client.VServerGateway().V2().VolumeService()
+	for page := 1; page <= snapshotListMaxPages; page++ {
+		if err := pctx.Err(); err != nil {
+			return nil, err
+		}
 
-	for _, snap := range res.Items {
-		if snap.VolumeId == pvolID && snap.Name == psnapshotName {
-			return &lsentity.Snapshot{Snapshot: snap}, nil
+		opt := lsdkVolumeV2.NewListSnapshotsByBlockVolumeIdRequest(page, snapshotListPageSize, pvolID)
+		res, err := volumeService.ListSnapshotsByBlockVolumeId(opt)
+		if err != nil {
+			return nil, err.GetError()
+		}
+		if res == nil {
+			break
+		}
+
+		for _, snap := range res.Items {
+			if snap.VolumeId == pvolID && snap.Name == psnapshotName {
+				return &lsentity.Snapshot{Snapshot: snap}, nil
+			}
+		}
+
+		// Two stop conditions, and which one applies depends on whether the
+		// server populated TotalPages - they must not be OR'd together.
+		//
+		// When TotalPages is usable it is the authority. Falling back to "this
+		// page was shorter than I asked for" in that case would mis-stop if the
+		// server ever caps the page size below the requested 100: every page
+		// would look short, the walk would end after page one, and this lookup
+		// would silently be the single-page version again. That is not a
+		// cosmetic regression - a missed lookup makes the create path produce a
+		// duplicate snapshot on every retry, which is the whole reason this
+		// walks pages at all.
+		//
+		// When TotalPages is 0 or negative the server told us nothing, and
+		// trusting it would stop at page one for the opposite reason
+		// (1 >= 0). Only then is the short-page heuristic the best signal
+		// available.
+		if res.TotalPages > 0 {
+			if page >= res.TotalPages {
+				break
+			}
+
+			continue
+		}
+		if len(res.Items) < snapshotListPageSize {
+			break
 		}
 	}
 
 	return nil, ErrSnapshotNotFound
 }
 
-func (s *cloud) CreateSnapshotFromVolume(pclusterId, pvolId, psnapshotName string) (*lsentity.Snapshot, error) {
+func (s *cloud) CreateSnapshotFromVolume(pctx lctx.Context, pclusterId, pvolId, psnapshotName string) (*lsentity.Snapshot, error) {
 	client, ierr := s.projectClient()
 	if ierr != nil {
 		return nil, ierr.GetError()
@@ -583,7 +631,7 @@ func (s *cloud) CreateSnapshotFromVolume(pclusterId, pvolId, psnapshotName strin
 		return nil, sdkErr.GetError()
 	}
 
-	err := s.waitSnapshotActive(pvolId, snapshot.Name)
+	err := s.waitSnapshotActive(pctx, pvolId, snapshot.Name)
 	return &lsentity.Snapshot{Snapshot: snapshot}, err
 }
 
