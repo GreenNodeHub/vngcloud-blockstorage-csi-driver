@@ -206,11 +206,11 @@ func TestEveryCloudMethodSurfacesAnUnresolvedProject(t *ltesting.T) {
 			return err
 		}},
 		{"GetVolumeSnapshotByName", func(pc Cloud) error {
-			_, err := pc.GetVolumeSnapshotByName(testVolumeId, "snapshot-1")
+			_, err := pc.GetVolumeSnapshotByName(ctx, testVolumeId, "snapshot-1")
 			return err
 		}},
 		{"CreateSnapshotFromVolume", func(pc Cloud) error {
-			_, err := pc.CreateSnapshotFromVolume("k8s-test", testVolumeId, "snapshot-1")
+			_, err := pc.CreateSnapshotFromVolume(ctx, "k8s-test", testVolumeId, "snapshot-1")
 			return err
 		}},
 		{"DeleteSnapshot", func(pc Cloud) error { return pc.DeleteSnapshot(testSnapshotId) }},

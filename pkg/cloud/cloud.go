@@ -547,7 +547,7 @@ func (s *cloud) GetDeviceDiskID(pvolID string) (string, error) {
 	return vol.UnderId, nil
 }
 
-func (s *cloud) GetVolumeSnapshotByName(pvolID, psnapshotName string) (*lsentity.Snapshot, error) {
+func (s *cloud) GetVolumeSnapshotByName(pctx lctx.Context, pvolID, psnapshotName string) (*lsentity.Snapshot, error) {
 	client, ierr := s.projectClient()
 	if ierr != nil {
 		return nil, ierr.GetError()
@@ -568,7 +568,7 @@ func (s *cloud) GetVolumeSnapshotByName(pvolID, psnapshotName string) (*lsentity
 	return nil, ErrSnapshotNotFound
 }
 
-func (s *cloud) CreateSnapshotFromVolume(pclusterId, pvolId, psnapshotName string) (*lsentity.Snapshot, error) {
+func (s *cloud) CreateSnapshotFromVolume(pctx lctx.Context, pclusterId, pvolId, psnapshotName string) (*lsentity.Snapshot, error) {
 	client, ierr := s.projectClient()
 	if ierr != nil {
 		return nil, ierr.GetError()
@@ -583,7 +583,7 @@ func (s *cloud) CreateSnapshotFromVolume(pclusterId, pvolId, psnapshotName strin
 		return nil, sdkErr.GetError()
 	}
 
-	err := s.waitSnapshotActive(pvolId, snapshot.Name)
+	err := s.waitSnapshotActive(pctx, pvolId, snapshot.Name)
 	return &lsentity.Snapshot{Snapshot: snapshot}, err
 }
 

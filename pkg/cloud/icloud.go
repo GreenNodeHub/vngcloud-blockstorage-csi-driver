@@ -24,8 +24,8 @@ type Cloud interface {
 	ResizeOrModifyDisk(ctx lctx.Context, volumeID string, newSizeBytes int64, options *ModifyDiskOptions) (newSize int64, err error)
 	ExpandVolume(ctx lctx.Context, volumeID, volumeTypeID string, newSize uint64) error
 	GetDeviceDiskID(pvolID string) (string, error)
-	GetVolumeSnapshotByName(pvolID, psnapshotName string) (*lsentity.Snapshot, error)
-	CreateSnapshotFromVolume(pclusterId, pvolId, psnapshotName string) (*lsentity.Snapshot, error)
+	GetVolumeSnapshotByName(pctx lctx.Context, pvolID, psnapshotName string) (*lsentity.Snapshot, error)
+	CreateSnapshotFromVolume(pctx lctx.Context, pclusterId, pvolId, psnapshotName string) (*lsentity.Snapshot, error)
 	DeleteSnapshot(psnapshotID string) error
 	ListSnapshots(pvolID string, ppage int, ppageSize int) (*lsentity.ListSnapshots, lserr.IError)
 	GetVolumeTypeById(pvolTypeId string) (*lsentity.VolumeType, lserr.IError)

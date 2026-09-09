@@ -8,7 +8,6 @@ import (
 
 	ljset "github.com/cuongpiger/joat/data-structure/set"
 	lset "github.com/cuongpiger/joat/data-structure/set"
-	ljwait "github.com/cuongpiger/joat/utils/exponential-backoff"
 	lsdkEntity "github.com/vngcloud/vngcloud-go-sdk/v2/vngcloud/entity"
 	lsdkErrs "github.com/vngcloud/vngcloud-go-sdk/v2/vngcloud/sdk_error"
 	lsdkVolume "github.com/vngcloud/vngcloud-go-sdk/v2/vngcloud/services/volume/v2"
@@ -63,18 +62,28 @@ func (s *cloud) getVolumeById(pvolId string) (*lsdkEntity.Volume, lserr.IError) 
 	return vol, nil
 }
 
-func (s *cloud) waitSnapshotActive(pvolID, psnapshotName string) error {
-	return ljwait.ExponentialBackoff(ljwait.NewBackOff(waitSnapshotActiveSteps, waitSnapshotActiveDelay, true, waitSnapshotActiveTimeout), func() (bool, error) {
-		vol, err := s.GetVolumeSnapshotByName(pvolID, psnapshotName)
+// waitSnapshotActive polls until the snapshot reports ACTIVE.
+//
+// The wait is bounded by pctx, not by an internal clock. csi-snapshotter is
+// deployed without --timeout and so gives up after its 15s default; the
+// handler has to die with it, because CreateSnapshot holds the inFlight key
+// for the snapshot name for as long as it runs and every retry that arrives
+// meanwhile is refused with "operation already exists". Under the previous
+// joat backoff (Revert=true, which makes the ceiling a FLOOR) the first sleep
+// was the longest and the loop ran on for the whole 5-minute timeout with
+// nobody left to answer.
+//
+// Read errors still abort the wait, as they always did on this path: the
+// caller fails the RPC, and the retry's idempotency lookup finds the snapshot
+// that was already created.
+func (s *cloud) waitSnapshotActive(pctx lctx.Context, pvolID, psnapshotName string) error {
+	return lwait.ExponentialBackoffWithContext(pctx, snapshotOperationBackoff, func(pctx lctx.Context) (bool, error) {
+		snap, err := s.GetVolumeSnapshotByName(pctx, pvolID, psnapshotName)
 		if err != nil {
 			return false, err
 		}
 
-		if vol.Status == SnapshotActiveStatus {
-			return true, nil
-		}
-
-		return false, nil
+		return snap.Status == SnapshotActiveStatus, nil
 	})
 }
 
