@@ -20,12 +20,6 @@ const (
 	DefaultVolumeSize int64 = 5 * lsutil.GiB
 )
 
-const (
-	waitSnapshotActiveTimeout = 5 * ltime.Minute
-	waitSnapshotActiveDelay   = 10
-	waitSnapshotActiveSteps   = 5
-)
-
 // Backoff for volume operations against the IaaS. Identical to what is already
 // deployed in vngcloud-manage-csi-driver, and modelled on aws-ebs-csi-driver
 // (pkg/cloud/cloud.go, volumeWaitParameters):
@@ -59,6 +53,28 @@ var (
 		Duration: 2 * ltime.Second,
 		Factor:   1.6,
 		Steps:    12,
+	}
+
+	// Waiting for a snapshot to go ACTIVE. Its own shape rather than the volume
+	// numbers, because the two ends of this wait pull in opposite directions:
+	//
+	//  1. The IaaS side is minutes-scale - a snapshot of a large volume is not
+	//     comparable to an attach. Hence a longer tail than
+	//     volumeOperationBackoff: polls at 0s, 1s, 2.5s, 4.75s, 8.1s, 13.2s,
+	//     20.8s, ... 581.9s, so ~9m42s in total for a caller that allows it.
+	//
+	//  2. The caller side is seconds-scale. The deployed csi-snapshotter passes
+	//     no --timeout, so it gives up after its 15s default; a gentler start
+	//     would spend that entire window asleep and turn every snapshot into a
+	//     retry. Factor 1.5 from 1s puts 6 polls inside those 15 seconds, so a
+	//     snapshot that goes ACTIVE quickly is reported on the first RPC.
+	//
+	// As with the volume backoffs the real deadline is the gRPC context, not
+	// Steps, and Cap stays unset - see the note above.
+	snapshotOperationBackoff = lwait.Backoff{
+		Duration: 1 * ltime.Second,
+		Factor:   1.5,
+		Steps:    15,
 	}
 )
 

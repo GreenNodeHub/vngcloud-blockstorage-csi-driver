@@ -169,6 +169,9 @@ func TestBackoffsStartFastAndDeclareNoCap(t *ltesting.T) {
 	for name, bo := range map[string]lwait.Backoff{
 		"volumeOperationBackoff": volumeOperationBackoff,
 		"volumeMigrationBackoff": volumeMigrationBackoff,
+		// The snapshot wait has the same two properties for the same reason,
+		// and a tighter caller: csi-snapshotter's default --timeout is 15s.
+		"snapshotOperationBackoff": snapshotOperationBackoff,
 	} {
 		if bo.Cap != 0 {
 			t.Errorf("%s sets Cap = %v; Cap zeroes Steps and truncates the wait budget", name, bo.Cap)
