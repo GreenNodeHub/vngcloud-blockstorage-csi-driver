@@ -46,6 +46,13 @@ type snapshotServiceStub struct {
 	totalPages int
 	alwaysFull bool
 
+	// reportNoPageCount forces TotalPages to 0, the "server told us nothing"
+	// case. It cannot be expressed with totalPages, which is only honoured when
+	// non-zero - leaving 0 there yields the stub's own honest count, and a test
+	// meaning to exercise the fallback would quietly take the TotalPages path
+	// instead. That is exactly what the first version of this test did.
+	reportNoPageCount bool
+
 	// err, when set, fails every list call.
 	err lsdkErrs.IError
 
@@ -109,6 +116,9 @@ func (s *snapshotServiceStub) ListSnapshotsByBlockVolumeId(popts lsdkVolumeV2.IL
 
 	if s.totalPages > 0 {
 		res.TotalPages = s.totalPages
+	}
+	if s.reportNoPageCount {
+		res.TotalPages = 0
 	}
 
 	return res, nil
@@ -284,11 +294,35 @@ func TestGetVolumeSnapshotByNameStopsAtTotalPagesAndStopsWhenFound(t *ltesting.T
 		}
 	})
 
-	// The mirror case: an honest listing of 3 pages behind a TotalPages of 5.
-	// A page shorter than asked for is the end of the data whatever the count
-	// says, so the walk must not spend two calls on pages that do not exist.
-	t.Run("stops at a short page even when the server claims more", func(t *ltesting.T) {
+	// The mirror case, and the rule here is deliberate: while the server
+	// reports a page count, that count wins even after a page comes back
+	// shorter than requested.
+	//
+	// Treating a short page as the end would be cheaper by two calls here, and
+	// wrong in the case that matters: if the server ever caps the page size
+	// below the 100 this asks for, EVERY page is short, the walk ends after
+	// page one, and this lookup is silently the single-page version it used to
+	// be. A missed lookup makes the create path produce a duplicate snapshot on
+	// every retry, against a shared project quota - so two wasted reads is the
+	// right trade.
+	t.Run("trusts the reported page count over a short page", func(t *ltesting.T) {
 		svc := &snapshotServiceStub{items: snapshotListing(2*snapshotListPageSize+1, -1), totalPages: 5}
+		c := newSnapshotStubbedCloud(t, svc)
+
+		_, err := c.GetVolumeSnapshotByName(lctx.Background(), testVolumeId, testSnapshotName)
+		if !lerrors.Is(err, ErrSnapshotNotFound) {
+			t.Fatalf("GetVolumeSnapshotByName() = %v, want ErrSnapshotNotFound", err)
+		}
+		if svc.calls != 5 {
+			t.Fatalf("made %d list calls while the server claimed 5 pages, want exactly 5", svc.calls)
+		}
+	})
+
+	// And when the server reports nothing usable, the short page is the only
+	// signal left. Trusting TotalPages here would stop at page one, because
+	// 1 >= 0 - the same single-page bug arrived at from the opposite direction.
+	t.Run("falls back to the short page when no page count is reported", func(t *ltesting.T) {
+		svc := &snapshotServiceStub{items: snapshotListing(2*snapshotListPageSize+1, -1), reportNoPageCount: true}
 		c := newSnapshotStubbedCloud(t, svc)
 
 		_, err := c.GetVolumeSnapshotByName(lctx.Background(), testVolumeId, testSnapshotName)
