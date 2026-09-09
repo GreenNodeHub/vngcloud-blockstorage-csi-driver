@@ -547,21 +547,48 @@ func (s *cloud) GetDeviceDiskID(pvolID string) (string, error) {
 	return vol.UnderId, nil
 }
 
+// GetVolumeSnapshotByName is the idempotency check on the create path, so a
+// snapshot it fails to find is a snapshot the driver creates a second time.
+// It used to ask for page 1 of ten and ignore the rest, which on a volume with
+// more than ten snapshots reported ErrSnapshotNotFound for a snapshot that
+// exists - once every retry, each one a duplicate against a shared project
+// quota.
+//
+// The walk ends on the first match, at the page count the server reports, at a
+// short or empty page, or at snapshotListMaxPages, whichever comes first. It
+// ends on pctx too: this runs inside waitSnapshotActive, whose caller gives up
+// after 15 seconds.
 func (s *cloud) GetVolumeSnapshotByName(pctx lctx.Context, pvolID, psnapshotName string) (*lsentity.Snapshot, error) {
 	client, ierr := s.projectClient()
 	if ierr != nil {
 		return nil, ierr.GetError()
 	}
 
-	opt := lsdkVolumeV2.NewListSnapshotsByBlockVolumeIdRequest(1, 10, pvolID)
-	res, err := client.VServerGateway().V2().VolumeService().ListSnapshotsByBlockVolumeId(opt)
-	if err != nil {
-		return nil, err.GetError()
-	}
+	volumeService := client.VServerGateway().V2().VolumeService()
+	for page := 1; page <= snapshotListMaxPages; page++ {
+		if err := pctx.Err(); err != nil {
+			return nil, err
+		}
 
-	for _, snap := range res.Items {
-		if snap.VolumeId == pvolID && snap.Name == psnapshotName {
-			return &lsentity.Snapshot{Snapshot: snap}, nil
+		opt := lsdkVolumeV2.NewListSnapshotsByBlockVolumeIdRequest(page, snapshotListPageSize, pvolID)
+		res, err := volumeService.ListSnapshotsByBlockVolumeId(opt)
+		if err != nil {
+			return nil, err.GetError()
+		}
+		if res == nil {
+			break
+		}
+
+		for _, snap := range res.Items {
+			if snap.VolumeId == pvolID && snap.Name == psnapshotName {
+				return &lsentity.Snapshot{Snapshot: snap}, nil
+			}
+		}
+
+		// A page shorter than asked for is the last one whatever TotalPages
+		// says, and an empty one means this page is already past the end.
+		if len(res.Items) < snapshotListPageSize || page >= res.TotalPages {
+			break
 		}
 	}
 

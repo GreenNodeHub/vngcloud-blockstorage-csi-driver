@@ -79,6 +79,23 @@ var (
 )
 
 const (
+	// Paging for the snapshot idempotency lookup.
+	//
+	// snapshotListPageSize is deliberately far above the ten this lookup used
+	// to ask for: the per-project API quota bucket is shared with every other
+	// consumer of the project and this driver has already been the thing that
+	// drained it, so the common case must cost one call, not one per ten
+	// snapshots.
+	//
+	// snapshotListMaxPages bounds the walk regardless of the TotalPages the
+	// server reports. That number is not ours, and a wrong one would page
+	// forever against the very quota this page size exists to protect. 50
+	// pages of 100 is far past any real volume's snapshot count.
+	snapshotListPageSize = 100
+	snapshotListMaxPages = 50
+)
+
+const (
 	VolumeAvailableStatus = "AVAILABLE"
 	VolumeInUseStatus     = "IN-USE"
 	VolumeCreatingStatus  = "CREATING"
