@@ -585,9 +585,30 @@ func (s *cloud) GetVolumeSnapshotByName(pctx lctx.Context, pvolID, psnapshotName
 			}
 		}
 
-		// A page shorter than asked for is the last one whatever TotalPages
-		// says, and an empty one means this page is already past the end.
-		if len(res.Items) < snapshotListPageSize || page >= res.TotalPages {
+		// Two stop conditions, and which one applies depends on whether the
+		// server populated TotalPages - they must not be OR'd together.
+		//
+		// When TotalPages is usable it is the authority. Falling back to "this
+		// page was shorter than I asked for" in that case would mis-stop if the
+		// server ever caps the page size below the requested 100: every page
+		// would look short, the walk would end after page one, and this lookup
+		// would silently be the single-page version again. That is not a
+		// cosmetic regression - a missed lookup makes the create path produce a
+		// duplicate snapshot on every retry, which is the whole reason this
+		// walks pages at all.
+		//
+		// When TotalPages is 0 or negative the server told us nothing, and
+		// trusting it would stop at page one for the opposite reason
+		// (1 >= 0). Only then is the short-page heuristic the best signal
+		// available.
+		if res.TotalPages > 0 {
+			if page >= res.TotalPages {
+				break
+			}
+
+			continue
+		}
+		if len(res.Items) < snapshotListPageSize {
 			break
 		}
 	}
