@@ -13,6 +13,8 @@ import (
 	ljson "k8s.io/component-base/logs/json"
 	llog "k8s.io/klog/v2"
 
+	lshooks "github.com/vngcloud/vngcloud-blockstorage-csi-driver/cmd/hooks"
+	lscloud "github.com/vngcloud/vngcloud-blockstorage-csi-driver/pkg/cloud"
 	lsdriver "github.com/vngcloud/vngcloud-blockstorage-csi-driver/pkg/driver"
 	lsmetrics "github.com/vngcloud/vngcloud-blockstorage-csi-driver/pkg/metrics"
 )
@@ -24,6 +26,13 @@ func main() {
 	}
 
 	options := GetOptions(fs)
+
+	// The hook is a short-lived command: run it and exit before any driver setup.
+	if string(options.DriverMode) == preStopHookCmd {
+		runPreStopHook()
+		return
+	}
+
 	// Start tracing as soon as possible
 	if options.ServerOptions.EnableOtelTracing {
 		exporter, err := lsdriver.InitOtelTracing()
@@ -70,6 +79,35 @@ func main() {
 		llog.ErrorS(err, "failed to run driver")
 		llog.FlushAndExit(llog.ExitFlushTimeout, 1)
 	}
+}
+
+// preStopHookCmd is a short-lived command, not a driver mode: it takes no driver
+// flags, needs no IaaS credentials and exits as soon as it is done.
+const preStopHookCmd = "pre-stop-hook"
+
+// runPreStopHook drains the VolumeAttachments of this node before the node plugin
+// dies, so NodeUnstage still has a plugin to run against. It exits the process
+// through osExit, which tests replace; the returns after it are for those tests.
+func runPreStopHook() {
+	clientset, err := lscloud.DefaultKubernetesAPIClient()
+	if err != nil {
+		// Termination must not be held up by a hook that cannot do its job at all.
+		llog.ErrorS(err, "[ERROR] - main: unable to communicate with the Kubernetes API, skipping the PreStop lifecycle hook")
+		llog.Flush()
+		osExit(0)
+		return
+	}
+
+	if err := lshooks.PreStop(clientset); err != nil {
+		// Exit non-zero so the failure surfaces as a FailedPreStopHook event.
+		llog.ErrorS(err, "[ERROR] - main: failed to execute the PreStop lifecycle hook")
+		llog.Flush()
+		osExit(1)
+		return
+	}
+
+	llog.Flush()
+	osExit(0)
 }
 
 var (
@@ -176,8 +214,11 @@ func GetOptions(fs *lflag.FlagSet) *Options {
 		controllerOptions.AddFlags(fs)
 		nodeOptions.AddFlags(fs)
 
+	case preStopHookCmd:
+		// No driver flags: the hook reads only CSI_NODE_NAME and the Kubernetes API.
+
 	default:
-		llog.Errorf("Unknown driver mode %s: Expected %s, %s, %s", cmd, lsdriver.ControllerMode, lsdriver.NodeMode, lsdriver.AllMode)
+		llog.Errorf("Unknown driver mode %s: Expected %s, %s, %s, or %s", cmd, lsdriver.ControllerMode, lsdriver.NodeMode, lsdriver.AllMode, preStopHookCmd)
 		llog.FlushAndExit(llog.ExitFlushTimeout, 0)
 	}
 
@@ -185,7 +226,7 @@ func GetOptions(fs *lflag.FlagSet) *Options {
 		panic(err)
 	}
 
-	if cmd != string(lsdriver.ControllerMode) {
+	if cmd != string(lsdriver.ControllerMode) && cmd != preStopHookCmd {
 		// nodeOptions must have been populated from the cmdline, validate them.
 		if err := nodeOptions.Validate(); err != nil {
 			llog.Error(err.Error())
@@ -231,6 +272,12 @@ func GetOptions(fs *lflag.FlagSet) *Options {
 
 func getConfigFromEnv(pnodeOpt NodeOptions, pcmd string) (*Global, error) {
 	var cfg Global
+
+	// The pre-stop hook never talks to the IaaS, so missing credentials must not
+	// stop it: the node container is being torn down when it runs.
+	if pcmd == preStopHookCmd {
+		return &cfg, nil
+	}
 
 	// User defined max volumes per node via the Helm Chart on worker nodes
 	if pnodeOpt.MaxVolumesPerNode > 0 && pcmd == string(lsdriver.NodeMode) {
