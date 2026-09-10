@@ -219,7 +219,10 @@ func (s *Driver) Run() error {
 	}
 
 	opts := []grpc.ServerOption{
-		grpc.UnaryInterceptor(logErr),
+		// Chained, not replaced: logErr is the operator-facing error log and
+		// metricsInterceptor is the dashboard-facing one. metricsInterceptor
+		// runs outermost so its duration covers the whole handler.
+		grpc.ChainUnaryInterceptor(metricsInterceptor, logErr),
 	}
 	if s.options.otelTracing {
 		opts = append(opts, grpc.StatsHandler(otelgrpc.NewServerHandler()))

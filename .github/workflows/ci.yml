@@ -4,7 +4,14 @@ name: CI
 # removed without touching protection settings.
 #
 # This repo keeps its existing build_dev.yml / build_prod.yml / release.yml for
-# deployment; ci.yml is only the quality gate for PRs into main.
+# deployment; ci.yml is the quality gate for PRs into main AND into dev.
+#
+# dev was added on 10/09/2026. Work lands in dev first and is ported to main
+# later, so gating only main meant every feature PR of an improvement
+# programme - #16 through #29 - merged into dev with no automated check at
+# all, and the first real CI run happened at port time, long after the code
+# was already deployed to a test cluster. The gate belongs where the code
+# lands first.
 #
 # UNLIKE control-plane: blockstorage-csi needs no github token for private
 # modules — both deps (vngcloud-go-sdk, vngcloud-csi-volume-modifier) are public
@@ -12,9 +19,9 @@ name: CI
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, dev]
   push:
-    branches: [main]
+    branches: [main, dev]
 
 jobs:
   build:
