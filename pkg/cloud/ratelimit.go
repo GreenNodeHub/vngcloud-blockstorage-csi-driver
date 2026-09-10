@@ -4,6 +4,7 @@ import (
 	lctx "context"
 	lfmt "fmt"
 	lhttp "net/http"
+	lstrconv "strconv"
 	lsync "sync"
 	ltime "time"
 
@@ -428,9 +429,20 @@ func (s *throttledHTTPClient) recordOutcome(
 		// "which call is failing and with what", while iaas_errors_total
 		// answers "what does that mean for a CSI operation". Keeping the raw
 		// code here is what makes the two independently useful.
+		//
+		// status is carried alongside because the code alone is often not
+		// enough. Measured on the dev cluster on 10/09/2026: the three attach
+		// retries a volume in IN-PROCESS state produces all reported
+		// code="UnknownError", because the SDK only stamps a specific code
+		// further up. The HTTP status is the discriminator the SDK does leave
+		// behind - it is the same field isThrottled reads to tell a 429 from
+		// a 403 - and without it a 429, a 409 and a 500 are one
+		// indistinguishable series.
 		lsmetrics.Recorder().IncreaseCount(
 			lsmetrics.APIRequestErrors, lsmetrics.APIRequestErrorsHelp, map[string]string{
-				"route": proute, "method": pmethod, "code": string(psdkErr.GetErrorCode()),
+				"route": proute, "method": pmethod,
+				"code":   string(psdkErr.GetErrorCode()),
+				"status": responseStatusLabel(psdkErr),
 			})
 	}
 
@@ -446,6 +458,27 @@ func (s *throttledHTTPClient) recordOutcome(
 func (s *throttledHTTPClient) publishLimiterQPS() {
 	lsmetrics.Recorder().SetGauge(
 		lsmetrics.RateLimiterQPS, lsmetrics.RateLimiterQPSHelp, s.limiter.currentQPS(), nil)
+}
+
+// responseStatusLabel renders the HTTP status the SDK recorded, or "none" when
+// no response arrived at all.
+//
+// "none" is a real and important value, not a fallback: statusCode is 0 when
+// the request never reached a server, which is how a DNS failure, a refused
+// connection and the 120s client timeout all present. Rendering those as "0"
+// would read as a status code; rendering them as "" would be an empty label.
+func responseStatusLabel(perr lsdkErrs.IError) string {
+	raw, ok := perr.GetParameters()["statusCode"]
+	if !ok {
+		return "none"
+	}
+
+	status, ok := raw.(int)
+	if !ok || status == 0 {
+		return "none"
+	}
+
+	return lstrconv.Itoa(status)
 }
 
 // requestMethodLabel keeps the method label non-empty. A request reaching the
