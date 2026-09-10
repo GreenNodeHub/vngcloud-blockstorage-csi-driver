@@ -396,11 +396,12 @@ func (s *throttledHTTPClient) DoRequest(purl string, preq lsdkClient.IRequest) (
 // It observes no duration: nothing was timed, and a 0s observation would drag
 // the latency histogram down precisely when the driver is most degraded.
 func (s *throttledHTTPClient) recordShed(proute, pmethod string) {
-	labels := map[string]string{"route": proute, "method": pmethod}
+	labels := map[string]string{lsmetrics.LabelRoute: proute, lsmetrics.LabelMethod: pmethod}
 
 	lsmetrics.Recorder().IncreaseCount(lsmetrics.APIRequestsShed, lsmetrics.APIRequestsShedHelp, labels)
 	lsmetrics.Recorder().IncreaseCount(lsmetrics.APIRequests, lsmetrics.APIRequestsHelp, map[string]string{
-		"route": proute, "method": pmethod, "outcome": lsmetrics.OutcomeShed,
+		lsmetrics.LabelRoute: proute, lsmetrics.LabelMethod: pmethod,
+		lsmetrics.LabelOutcome: lsmetrics.OutcomeShed,
 	})
 	s.publishLimiterQPS()
 }
@@ -410,14 +411,15 @@ func (s *throttledHTTPClient) recordOutcome(
 	proute, pmethod, poutcome string, pelapsed ltime.Duration,
 	presp *lreq.Response, psdkErr lsdkErrs.IError,
 ) {
-	labels := map[string]string{"route": proute, "method": pmethod}
+	labels := map[string]string{lsmetrics.LabelRoute: proute, lsmetrics.LabelMethod: pmethod}
 
 	lsmetrics.Recorder().ObserveHistogram(
 		lsmetrics.APIRequestDuration, lsmetrics.APIRequestDurationHelp,
 		pelapsed.Seconds(), labels, lsmetrics.APIRequestDurationBuckets,
 	)
 	lsmetrics.Recorder().IncreaseCount(lsmetrics.APIRequests, lsmetrics.APIRequestsHelp, map[string]string{
-		"route": proute, "method": pmethod, "outcome": poutcome,
+		lsmetrics.LabelRoute: proute, lsmetrics.LabelMethod: pmethod,
+		lsmetrics.LabelOutcome: poutcome,
 	})
 
 	if poutcome == lsmetrics.OutcomeThrottled {
@@ -441,9 +443,10 @@ func (s *throttledHTTPClient) recordOutcome(
 		// indistinguishable series.
 		lsmetrics.Recorder().IncreaseCount(
 			lsmetrics.APIRequestErrors, lsmetrics.APIRequestErrorsHelp, map[string]string{
-				"route": proute, "method": pmethod,
-				"code":   string(psdkErr.GetErrorCode()),
-				"status": responseStatusLabel(presp, psdkErr),
+				lsmetrics.LabelRoute:  proute,
+				lsmetrics.LabelMethod: pmethod,
+				lsmetrics.LabelCode:   string(psdkErr.GetErrorCode()),
+				lsmetrics.LabelStatus: responseStatusLabel(presp, psdkErr),
 			})
 	}
 
@@ -494,17 +497,17 @@ func responseStatusLabel(presp *lreq.Response, perr lsdkErrs.IError) string {
 	}
 
 	if perr == nil {
-		return "none"
+		return lsmetrics.StatusNone
 	}
 
 	raw, ok := perr.GetParameters()["statusCode"]
 	if !ok {
-		return "none"
+		return lsmetrics.StatusNone
 	}
 
 	status, ok := raw.(int)
 	if !ok || status == 0 {
-		return "none"
+		return lsmetrics.StatusNone
 	}
 
 	return lstrconv.Itoa(status)

@@ -82,6 +82,25 @@ const (
 	CreateGateWaitSecondsHelp = "seconds a CreateVolume call waited for a slot in the concurrency gate"
 )
 
+// Label KEYS, shared by every package that publishes these metrics.
+//
+// Constants rather than literals because a mistyped key does not fail: it
+// silently registers a second series under a name no dashboard queries, and
+// the original then looks like it stopped moving. That is the exact class of
+// silent-wrong-metric failure this whole surface exists to remove, so the keys
+// are declared once.
+const (
+	LabelRoute    = "route"
+	LabelMethod   = "method"
+	LabelOutcome  = "outcome"
+	LabelCode     = "code"
+	LabelStatus   = "status"
+	LabelOp       = "op"
+	LabelReason   = "reason"
+	LabelVolumeID = "volume_id"
+	LabelNodeID   = "node_id"
+)
+
 // Label values for outcome, shared so a dashboard query cannot drift from what
 // the code emits.
 const (
@@ -90,6 +109,22 @@ const (
 	OutcomeThrottled = "throttled"
 	OutcomeShed      = "shed"
 )
+
+// CSI operations the iaas_errors_total counter reports against.
+const (
+	OpCreate = "create"
+	OpAttach = "attach"
+	OpDetach = "detach"
+)
+
+// StatusNone is the status label for a call that got no HTTP response at all -
+// a refused connection, a DNS failure, the client timeout. Deliberately not
+// "0": on a dashboard that reads as an HTTP status, and there is no such code.
+const StatusNone = "none"
+
+// ValueUnknown labels something the driver could not identify: a URL matching
+// no known route, or a gRPC method name that is not a valid FullMethod.
+const ValueUnknown = "unknown"
 
 // APIRequestDurationBuckets tops out at 120s because that is exactly the SDK's
 // request timeout (v2.21.0) and retry is disabled, so no single call can

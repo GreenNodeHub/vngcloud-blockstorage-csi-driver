@@ -296,7 +296,7 @@ func (s *controllerService) reportCreateIaaSError(pctx lctx.Context, preq *lcsi.
 
 	cls := lscloud.Classify(pierr)
 	lsmetrics.Recorder().IncreaseCount(lsmetrics.IaaSErrors, lsmetrics.IaaSErrorsHelp, map[string]string{
-		"op": "create", "reason": cls.Reason,
+		lsmetrics.LabelOp: lsmetrics.OpCreate, lsmetrics.LabelReason: cls.Reason,
 	})
 
 	ns, name := getCreateVolumeRequestNamespacedName(preq)
@@ -503,7 +503,7 @@ func (s *controllerService) ControllerUnpublishVolume(pctx lctx.Context, preq *l
 func (s *controllerService) evictStaleDetachState(pnow ltime.Time) {
 	for _, stale := range s.detachBreaker.EvictStale(pnow) {
 		lsmetrics.Recorder().DeleteGauge(lsmetrics.DetachPendingSeconds, map[string]string{
-			"volume_id": stale.VolumeID, "node_id": stale.NodeID,
+			lsmetrics.LabelVolumeID: stale.VolumeID, lsmetrics.LabelNodeID: stale.NodeID,
 		})
 	}
 }
@@ -530,7 +530,7 @@ func (s *controllerService) clearDetachStateOnAttach(pkey lsinternal.BreakerKey,
 
 	s.detachBreaker.Success(pkey)
 	lsmetrics.Recorder().DeleteGauge(lsmetrics.DetachPendingSeconds, map[string]string{
-		"volume_id": pkey.VolumeID, "node_id": pkey.NodeID,
+		lsmetrics.LabelVolumeID: pkey.VolumeID, lsmetrics.LabelNodeID: pkey.NodeID,
 	})
 }
 
@@ -547,7 +547,7 @@ func (s *controllerService) onDetachFailed(
 	// Unconditional: iaas_errors_total is the series that covers failures the
 	// breaker has not opened on yet.
 	lsmetrics.Recorder().IncreaseCount(lsmetrics.IaaSErrors, lsmetrics.IaaSErrorsHelp, map[string]string{
-		"op": "detach", "reason": cls.Reason,
+		lsmetrics.LabelOp: lsmetrics.OpDetach, lsmetrics.LabelReason: cls.Reason,
 	})
 
 	// The gauge is only meaningful for a pair the breaker has actually opened
@@ -558,7 +558,7 @@ func (s *controllerService) onDetachFailed(
 	// updated the entry by the time Since reads it.
 	if isTripped {
 		lsmetrics.Recorder().SetGauge(lsmetrics.DetachPendingSeconds, lsmetrics.DetachPendingSecondsHelp, stuck.Seconds(), map[string]string{
-			"volume_id": pvolumeID, "node_id": pnodeID,
+			lsmetrics.LabelVolumeID: pvolumeID, lsmetrics.LabelNodeID: pnodeID,
 		})
 	}
 
@@ -567,7 +567,7 @@ func (s *controllerService) onDetachFailed(
 	}
 
 	lsmetrics.Recorder().IncreaseCount(lsmetrics.DetachBreakerTrips, lsmetrics.DetachBreakerTripsHelp, map[string]string{
-		"reason": cls.Reason,
+		lsmetrics.LabelReason: cls.Reason,
 	})
 
 	msg := lfmt.Sprintf(
@@ -588,7 +588,7 @@ func (s *controllerService) onDetachSucceeded(
 	// Unconditional: deleting an absent series is a cheap no-op, and it is the
 	// one call that must not be skipped by mistake.
 	lsmetrics.Recorder().DeleteGauge(lsmetrics.DetachPendingSeconds, map[string]string{
-		"volume_id": pvolumeID, "node_id": pnodeID,
+		lsmetrics.LabelVolumeID: pvolumeID, lsmetrics.LabelNodeID: pnodeID,
 	})
 
 	// Only a pair that actually tripped gets a recovery event. A pair that
@@ -633,7 +633,7 @@ func (s *controllerService) reportAttachIaaSError(pctx lctx.Context, pvolumeID, 
 
 	cls := lscloud.Classify(pierr)
 	lsmetrics.Recorder().IncreaseCount(lsmetrics.IaaSErrors, lsmetrics.IaaSErrorsHelp, map[string]string{
-		"op": "attach", "reason": cls.Reason,
+		lsmetrics.LabelOp: lsmetrics.OpAttach, lsmetrics.LabelReason: cls.Reason,
 	})
 
 	// The reason field already carries the classification. Repeating it in the

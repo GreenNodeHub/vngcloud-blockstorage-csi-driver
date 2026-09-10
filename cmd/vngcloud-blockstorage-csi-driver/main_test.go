@@ -14,6 +14,8 @@ import (
 	lscloud "github.com/vngcloud/vngcloud-blockstorage-csi-driver/pkg/cloud"
 )
 
+const testNodeName = "test-node"
+
 // pre-stop-hook is a short-lived command, not a driver mode: it must not be rejected
 // as an unknown mode, and it must not require the node flags or the IaaS credentials
 // that every driver mode reads from the environment - the node container only needs
@@ -52,7 +54,7 @@ func TestRunPreStopHookExitCodes(t *ltesting.T) {
 	}{
 		{
 			name:     "Kubernetes API unreachable: do not hold up termination",
-			nodeName: "test-node",
+			nodeName: testNodeName,
 			client: func() (lk8s.Interface, error) {
 				return nil, lerrors.New("no in-cluster config")
 			},
@@ -68,10 +70,10 @@ func TestRunPreStopHookExitCodes(t *ltesting.T) {
 		},
 		{
 			name:     "hook ran: the node is not being drained",
-			nodeName: "test-node",
+			nodeName: testNodeName,
 			client: func() (lk8s.Interface, error) {
 				return lfake.NewSimpleClientset(&lk8score.Node{
-					ObjectMeta: lmetav1.ObjectMeta{Name: "test-node"},
+					ObjectMeta: lmetav1.ObjectMeta{Name: testNodeName},
 				}), nil
 			},
 			wantExitCode: 0,

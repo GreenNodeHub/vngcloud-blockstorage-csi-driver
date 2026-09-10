@@ -20,10 +20,10 @@ func TestRPCOperationLabel(t *ltesting.T) {
 		{"/csi.v1.Identity/Probe", "Probe"},
 		// Not a valid gRPC FullMethod; the label says so rather than
 		// inventing an operation name from a malformed string.
-		{"NoSlashes", "unknown"},
-		{"", "unknown"},
-		{"/", "unknown"},
-		{"trailing/", "unknown"},
+		{"NoSlashes", lsmetrics.ValueUnknown},
+		{"", lsmetrics.ValueUnknown},
+		{"/", lsmetrics.ValueUnknown},
+		{"trailing/", lsmetrics.ValueUnknown},
 	} {
 		if got := rpcOperationLabel(tc.in); got != tc.want {
 			t.Errorf("rpcOperationLabel(%q) = %q, want %q", tc.in, got, tc.want)
@@ -39,7 +39,7 @@ func TestMetricsInterceptorCountsInFlightDuringTheHandler(t *ltesting.T) {
 	lsmetrics.InitializeRecorder()
 
 	info := &lgrpc.UnaryServerInfo{FullMethod: "/csi.v1.Controller/ControllerPublishVolume"}
-	labels := map[string]string{"op": "ControllerPublishVolume"}
+	labels := map[string]string{lsmetrics.LabelOp: "ControllerPublishVolume"}
 
 	before := gaugeValueWithLabels(t, lsmetrics.OperationsInFlight, labels)
 
@@ -68,7 +68,7 @@ func TestMetricsInterceptorReleasesInFlightOnError(t *ltesting.T) {
 	lsmetrics.InitializeRecorder()
 
 	info := &lgrpc.UnaryServerInfo{FullMethod: "/csi.v1.Controller/DeleteVolume"}
-	labels := map[string]string{"op": "DeleteVolume"}
+	labels := map[string]string{lsmetrics.LabelOp: "DeleteVolume"}
 
 	before := gaugeValueWithLabels(t, lsmetrics.OperationsInFlight, labels)
 
@@ -84,7 +84,7 @@ func TestMetricsInterceptorReleasesInFlightOnError(t *ltesting.T) {
 	}
 
 	if got := counterFromHistogram(t, lsmetrics.OperationDuration,
-		map[string]string{"op": "DeleteVolume", "outcome": lsmetrics.OutcomeError}); got == 0 {
+		map[string]string{lsmetrics.LabelOp: "DeleteVolume", lsmetrics.LabelOutcome: lsmetrics.OutcomeError}); got == 0 {
 		t.Error("a failed RPC recorded no duration under outcome=error")
 	}
 }
@@ -96,7 +96,7 @@ func TestMetricsInterceptorRecordsRealDuration(t *ltesting.T) {
 
 	const delay = 25 * ltime.Millisecond
 	info := &lgrpc.UnaryServerInfo{FullMethod: "/csi.v1.Controller/CreateVolume"}
-	labels := map[string]string{"op": "CreateVolume", "outcome": lsmetrics.OutcomeOK}
+	labels := map[string]string{lsmetrics.LabelOp: "CreateVolume", lsmetrics.LabelOutcome: lsmetrics.OutcomeOK}
 
 	before := sumFromHistogram(t, lsmetrics.OperationDuration, labels)
 
@@ -121,7 +121,7 @@ func TestMetricsInterceptorCountsConcurrentCalls(t *ltesting.T) {
 	lsmetrics.InitializeRecorder()
 
 	info := &lgrpc.UnaryServerInfo{FullMethod: "/csi.v1.Controller/ValidateVolumeCapabilities"}
-	labels := map[string]string{"op": "ValidateVolumeCapabilities"}
+	labels := map[string]string{lsmetrics.LabelOp: "ValidateVolumeCapabilities"}
 
 	before := gaugeValueWithLabels(t, lsmetrics.OperationsInFlight, labels)
 
@@ -169,7 +169,7 @@ func TestInitializeStartupMetricsCreatesZeroValuedSeries(t *ltesting.T) {
 	lsmetrics.InitializeRecorder()
 	InitializeStartupMetrics(ControllerMode)
 
-	labels := map[string]string{"op": "detach", "reason": "IaaSUnreachable"}
+	labels := map[string]string{lsmetrics.LabelOp: "detach", lsmetrics.LabelReason: "IaaSUnreachable"}
 	m := findSample(t, lsmetrics.IaaSErrors, labels)
 	if m == nil {
 		t.Fatalf("%s%v was not created at startup", lsmetrics.IaaSErrors, labels)
@@ -181,7 +181,7 @@ func TestInitializeStartupMetricsCreatesZeroValuedSeries(t *ltesting.T) {
 	// A histogram pre-created by observing would carry a fake sample; it must
 	// exist with no observations at all.
 	h := findSample(t, lsmetrics.APIRequestDuration,
-		map[string]string{"route": "volumes/{id}/servers/{id}/detach", "method": "PUT"})
+		map[string]string{lsmetrics.LabelRoute: "volumes/{id}/servers/{id}/detach", lsmetrics.LabelMethod: "PUT"})
 	if h == nil {
 		t.Fatal("api_request_duration was not pre-created for the detach route")
 	}
@@ -211,7 +211,7 @@ func TestStartupSeriesSkipsControllerSeriesInNodeMode(t *ltesting.T) {
 	// The API series are shared: a node plugin builds its own SDK client and
 	// talks to vServer too.
 	if !hasSpec(node, lsmetrics.APIRequests, map[string]string{
-		"route": "volumes/{id}", "method": "GET", "outcome": lsmetrics.OutcomeOK,
+		lsmetrics.LabelRoute: "volumes/{id}", lsmetrics.LabelMethod: "GET", lsmetrics.LabelOutcome: lsmetrics.OutcomeOK,
 	}) {
 		t.Error("node mode did not pre-create the shared API series")
 	}
@@ -233,14 +233,14 @@ func TestStartupSeriesControllerModeCoversEveryRouteAndReason(t *ltesting.T) {
 	}
 
 	for _, reason := range reasons {
-		if !hasSpec(specs, lsmetrics.IaaSErrors, map[string]string{"op": "detach", "reason": reason}) {
+		if !hasSpec(specs, lsmetrics.IaaSErrors, map[string]string{lsmetrics.LabelOp: lsmetrics.OpDetach, lsmetrics.LabelReason: reason}) {
 			t.Errorf("no pre-created iaas_errors series for reason %q", reason)
 		}
 	}
 
 	for _, rm := range routes {
 		if !hasSpec(specs, lsmetrics.APIRequestDuration,
-			map[string]string{"route": rm.Route, "method": rm.Method}) {
+			map[string]string{lsmetrics.LabelRoute: rm.Route, lsmetrics.LabelMethod: rm.Method}) {
 			t.Errorf("no pre-created duration series for %q %s", rm.Route, rm.Method)
 		}
 	}
