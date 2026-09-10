@@ -12,6 +12,8 @@ import (
 	lsdkErrs "github.com/vngcloud/vngcloud-go-sdk/v2/vngcloud/sdk_error"
 	lrate "golang.org/x/time/rate"
 	llog "k8s.io/klog/v2"
+
+	lsmetrics "github.com/vngcloud/vngcloud-blockstorage-csi-driver/pkg/metrics"
 )
 
 // Client-side adaptive throttling for every request leaving for vServer.
@@ -335,36 +337,126 @@ func NewThrottledHTTPClient(pctx lctx.Context) lsdkClient.IHttpClient {
 }
 
 func (s *throttledHTTPClient) DoRequest(purl string, preq lsdkClient.IRequest) (*lreq.Response, lsdkErrs.IError) {
+	// Both labels are computed once, up front, because every exit path below
+	// needs them and NormalizeAPIRoute must never see a URL only some paths
+	// normalised.
+	route := NormalizeAPIRoute(purl)
+	method := requestMethodLabel(preq)
+
 	if !s.limiter.wait() {
 		llog.InfoS("[WARN] - rateLimiter: shedding request, token wait exceeds budget",
-			"url", purl, "method", preq.GetRequestMethod(), "qps", s.limiter.currentQPS())
+			"url", purl, "method", method, "qps", s.limiter.currentQPS())
+
+		s.recordShed(route, method)
 
 		return nil, errClientRateLimited(purl)
 	}
 
+	start := ltime.Now()
 	resp, sdkErr := s.inner.DoRequest(purl, preq)
+	elapsed := ltime.Since(start)
 
 	switch {
 	case isThrottled(sdkErr):
 		s.limiter.onThrottled(ltime.Now())
 		// Record the truth the SDK is about to mask: this is a 429, not a 403.
 		llog.InfoS("[WARN] - rateLimiter: request throttled by vServer (HTTP 429, reported as PermissionDenied)",
-			"url", purl, "method", preq.GetRequestMethod())
+			"url", purl, "method", method)
+		s.recordOutcome(route, method, lsmetrics.OutcomeThrottled, elapsed, sdkErr)
 
 	case isServerError(sdkErr):
 		// Backpressure - see the policy comment on
 		// rateLimitServerErrorDecreaseFactor. Logging happens inside
 		// onServerError, only when the rate actually moves.
 		s.limiter.onServerError(ltime.Now())
+		s.recordOutcome(route, method, lsmetrics.OutcomeError, elapsed, sdkErr)
 
 	default:
 		// Anything else - a success, a 404, a genuine 403 - is evidence we are
 		// no longer being quota-squeezed. (Transport-level failures also land
 		// here; see isServerError for why.)
 		s.limiter.onSuccess(ltime.Now())
+
+		// A 404 or a genuine 403 is still a failed call, so the outcome is
+		// decided by whether an error came back - NOT by which limiter branch
+		// we took. Conflating the two would report every non-throttle,
+		// non-5xx failure as a success.
+		if sdkErr != nil {
+			s.recordOutcome(route, method, lsmetrics.OutcomeError, elapsed, sdkErr)
+		} else {
+			s.recordOutcome(route, method, lsmetrics.OutcomeOK, elapsed, nil)
+		}
 	}
 
 	return resp, sdkErr
+}
+
+// recordShed counts a request the limiter dropped before it left the process.
+// It observes no duration: nothing was timed, and a 0s observation would drag
+// the latency histogram down precisely when the driver is most degraded.
+func (s *throttledHTTPClient) recordShed(proute, pmethod string) {
+	labels := map[string]string{"route": proute, "method": pmethod}
+
+	lsmetrics.Recorder().IncreaseCount(lsmetrics.APIRequestsShed, lsmetrics.APIRequestsShedHelp, labels)
+	lsmetrics.Recorder().IncreaseCount(lsmetrics.APIRequests, lsmetrics.APIRequestsHelp, map[string]string{
+		"route": proute, "method": pmethod, "outcome": lsmetrics.OutcomeShed,
+	})
+	s.publishLimiterQPS()
+}
+
+// recordOutcome publishes the per-call series for one completed round trip.
+func (s *throttledHTTPClient) recordOutcome(
+	proute, pmethod, poutcome string, pelapsed ltime.Duration, psdkErr lsdkErrs.IError,
+) {
+	labels := map[string]string{"route": proute, "method": pmethod}
+
+	lsmetrics.Recorder().ObserveHistogram(
+		lsmetrics.APIRequestDuration, lsmetrics.APIRequestDurationHelp,
+		pelapsed.Seconds(), labels, lsmetrics.APIRequestDurationBuckets,
+	)
+	lsmetrics.Recorder().IncreaseCount(lsmetrics.APIRequests, lsmetrics.APIRequestsHelp, map[string]string{
+		"route": proute, "method": pmethod, "outcome": poutcome,
+	})
+
+	if poutcome == lsmetrics.OutcomeThrottled {
+		lsmetrics.Recorder().IncreaseCount(
+			lsmetrics.APIRequestThrottles, lsmetrics.APIRequestThrottlesHelp, labels)
+	}
+
+	if psdkErr != nil {
+		// The SDK's own code, not a classified reason: this series answers
+		// "which call is failing and with what", while iaas_errors_total
+		// answers "what does that mean for a CSI operation". Keeping the raw
+		// code here is what makes the two independently useful.
+		lsmetrics.Recorder().IncreaseCount(
+			lsmetrics.APIRequestErrors, lsmetrics.APIRequestErrorsHelp, map[string]string{
+				"route": proute, "method": pmethod, "code": string(psdkErr.GetErrorCode()),
+			})
+	}
+
+	s.publishLimiterQPS()
+}
+
+// publishLimiterQPS mirrors the limiter's current ceiling into a gauge.
+//
+// Published from the request path rather than from a ticker because the
+// limiter's rate only ever moves inside onThrottled/onServerError/onSuccess,
+// which only run when a request happens. A ticker would add a goroutine that
+// re-publishes an unchanged value.
+func (s *throttledHTTPClient) publishLimiterQPS() {
+	lsmetrics.Recorder().SetGauge(
+		lsmetrics.RateLimiterQPS, lsmetrics.RateLimiterQPSHelp, s.limiter.currentQPS(), nil)
+}
+
+// requestMethodLabel keeps the method label non-empty. A request reaching the
+// client without a method set would otherwise produce an empty label value,
+// which is legal for Prometheus and unreadable on a dashboard.
+func requestMethodLabel(preq lsdkClient.IRequest) string {
+	if m := preq.GetRequestMethod(); m != "" {
+		return m
+	}
+
+	return "UNKNOWN"
 }
 
 func (s *throttledHTTPClient) WithRetryCount(pretryCount int) lsdkClient.IHttpClient {

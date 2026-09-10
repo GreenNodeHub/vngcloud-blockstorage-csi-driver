@@ -24,6 +24,28 @@ const (
 	ReasonIaaSUnknownError          = "IaaSUnknownError"
 )
 
+// AllErrorReasons is every value Classify can put in a Reason, so those
+// metric series can be created at zero on startup rather than appearing only
+// once the corresponding failure happens for the first time.
+//
+// Keeping it beside the constants is deliberate: a reason added above without
+// being added here still works, it just loses its pre-created series - and the
+// test in errclass_test.go asserts the two stay in step.
+func AllErrorReasons() []string {
+	return []string{
+		ReasonVolumeQuotaExceeded,
+		ReasonVolumeSizeQuotaExceeded,
+		ReasonVolumeAttachQuotaExceeded,
+		ReasonIaaSPermissionDenied,
+		ReasonVolumeInErrorState,
+		ReasonIaaSThrottled,
+		ReasonIaaSServerError,
+		ReasonIaaSUnreachable,
+		ReasonIaaSOperationStalled,
+		ReasonIaaSUnknownError,
+	}
+}
+
 // Class says what an IaaS error means for retry policy.
 //
 // Terminal means retrying the same call will never succeed on its own - a

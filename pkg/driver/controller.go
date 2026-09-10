@@ -138,7 +138,25 @@ func (s *controllerService) CreateVolume(pctx lctx.Context, preq *lcsi.CreateVol
 	// churn - and ends with pctx: the sidecar's own timeout cancels it, the CO
 	// retries, and the duplicate is cheaply rejected by the inflight cache
 	// above while this handler still holds the name.
-	if err := s.createGate.Acquire(pctx); err != nil {
+	//
+	// The two gate series exist because the cap is a compile-time constant
+	// backed by a single experiment: without them there is no way to tell a
+	// cap that is throttling real work from one that is never reached.
+	lsmetrics.Recorder().AddGauge(lsmetrics.CreateGateWaiting, lsmetrics.CreateGateWaitingHelp, 1, nil)
+	gateStart := ltime.Now()
+
+	gateErr := s.createGate.Acquire(pctx)
+
+	lsmetrics.Recorder().AddGauge(lsmetrics.CreateGateWaiting, lsmetrics.CreateGateWaitingHelp, -1, nil)
+	// Observed on both paths: a wait that ended in cancellation is exactly the
+	// case worth seeing, and dropping it would bias the histogram towards the
+	// waits that succeeded.
+	lsmetrics.Recorder().ObserveHistogram(
+		lsmetrics.CreateGateWaitSeconds, lsmetrics.CreateGateWaitSecondsHelp,
+		ltime.Since(gateStart).Seconds(), nil, lsmetrics.CreateGateWaitBuckets,
+	)
+
+	if gateErr != nil {
 		llog.InfoS("[INFO] - CreateVolume: Context ended while waiting for a create slot", "volumeName", volName)
 		return nil, ErrWaitingForCreateSlot(volName)
 	}
@@ -259,7 +277,7 @@ func (s *controllerService) CreateVolume(pctx lctx.Context, preq *lcsi.CreateVol
 }
 
 // reportCreateIaaSError publishes the two operator-facing halves of one IaaS
-// failure on the create path: the op="create" series of MetricIaaSErrors and a
+// failure on the create path: the op="create" series of lsmetrics.IaaSErrors and a
 // Warning on the PVC named after the classified reason.
 //
 // A specific reason is what makes the event actionable: "quota exhausted"
@@ -277,7 +295,7 @@ func (s *controllerService) reportCreateIaaSError(pctx lctx.Context, preq *lcsi.
 	}
 
 	cls := lscloud.Classify(pierr)
-	lsmetrics.Recorder().IncreaseCount(MetricIaaSErrors, MetricIaaSErrorsHelp, map[string]string{
+	lsmetrics.Recorder().IncreaseCount(lsmetrics.IaaSErrors, lsmetrics.IaaSErrorsHelp, map[string]string{
 		"op": "create", "reason": cls.Reason,
 	})
 
@@ -484,7 +502,7 @@ func (s *controllerService) ControllerUnpublishVolume(pctx lctx.Context, preq *l
 // permanently on a healthy cluster - the alert silencing itself.
 func (s *controllerService) evictStaleDetachState(pnow ltime.Time) {
 	for _, stale := range s.detachBreaker.EvictStale(pnow) {
-		lsmetrics.Recorder().DeleteGauge(MetricDetachPendingSeconds, map[string]string{
+		lsmetrics.Recorder().DeleteGauge(lsmetrics.DetachPendingSeconds, map[string]string{
 			"volume_id": stale.VolumeID, "node_id": stale.NodeID,
 		})
 	}
@@ -511,7 +529,7 @@ func (s *controllerService) clearDetachStateOnAttach(pkey lsinternal.BreakerKey,
 	s.evictStaleDetachState(pnow)
 
 	s.detachBreaker.Success(pkey)
-	lsmetrics.Recorder().DeleteGauge(MetricDetachPendingSeconds, map[string]string{
+	lsmetrics.Recorder().DeleteGauge(lsmetrics.DetachPendingSeconds, map[string]string{
 		"volume_id": pkey.VolumeID, "node_id": pkey.NodeID,
 	})
 }
@@ -528,7 +546,7 @@ func (s *controllerService) onDetachFailed(
 
 	// Unconditional: iaas_errors_total is the series that covers failures the
 	// breaker has not opened on yet.
-	lsmetrics.Recorder().IncreaseCount(MetricIaaSErrors, MetricIaaSErrorsHelp, map[string]string{
+	lsmetrics.Recorder().IncreaseCount(lsmetrics.IaaSErrors, lsmetrics.IaaSErrorsHelp, map[string]string{
 		"op": "detach", "reason": cls.Reason,
 	})
 
@@ -539,7 +557,7 @@ func (s *controllerService) onDetachFailed(
 	// failure stepped it, or it was already open - because Failure has already
 	// updated the entry by the time Since reads it.
 	if isTripped {
-		lsmetrics.Recorder().SetGauge(MetricDetachPendingSeconds, MetricDetachPendingSecondsHelp, stuck.Seconds(), map[string]string{
+		lsmetrics.Recorder().SetGauge(lsmetrics.DetachPendingSeconds, lsmetrics.DetachPendingSecondsHelp, stuck.Seconds(), map[string]string{
 			"volume_id": pvolumeID, "node_id": pnodeID,
 		})
 	}
@@ -548,7 +566,7 @@ func (s *controllerService) onDetachFailed(
 		return
 	}
 
-	lsmetrics.Recorder().IncreaseCount(MetricDetachBreakerTrips, MetricDetachBreakerTripsHelp, map[string]string{
+	lsmetrics.Recorder().IncreaseCount(lsmetrics.DetachBreakerTrips, lsmetrics.DetachBreakerTripsHelp, map[string]string{
 		"reason": cls.Reason,
 	})
 
@@ -569,7 +587,7 @@ func (s *controllerService) onDetachSucceeded(
 
 	// Unconditional: deleting an absent series is a cheap no-op, and it is the
 	// one call that must not be skipped by mistake.
-	lsmetrics.Recorder().DeleteGauge(MetricDetachPendingSeconds, map[string]string{
+	lsmetrics.Recorder().DeleteGauge(lsmetrics.DetachPendingSeconds, map[string]string{
 		"volume_id": pvolumeID, "node_id": pnodeID,
 	})
 
@@ -614,7 +632,7 @@ func (s *controllerService) reportAttachIaaSError(pctx lctx.Context, pvolumeID, 
 	}
 
 	cls := lscloud.Classify(pierr)
-	lsmetrics.Recorder().IncreaseCount(MetricIaaSErrors, MetricIaaSErrorsHelp, map[string]string{
+	lsmetrics.Recorder().IncreaseCount(lsmetrics.IaaSErrors, lsmetrics.IaaSErrorsHelp, map[string]string{
 		"op": "attach", "reason": cls.Reason,
 	})
 
