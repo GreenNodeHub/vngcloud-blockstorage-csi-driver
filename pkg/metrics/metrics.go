@@ -5,6 +5,9 @@ import (
 	"sync"
 	"time"
 
+	lprom "github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
+	ldto "github.com/prometheus/client_model/go"
 	"k8s.io/component-base/metrics"
 	"k8s.io/klog/v2"
 )
@@ -127,6 +130,123 @@ func (m *metricRecorder) DeleteGauge(name string, labels map[string]string) {
 	metric.(*metrics.GaugeVec).Delete(metrics.Labels(labels))
 }
 
+// AddGauge moves a gauge by a delta, registering it on first use. Needed for
+// the in-flight gauge: two concurrent RPCs must each be counted, which Set
+// cannot express without the caller keeping its own counter and racing on it.
+func (m *metricRecorder) AddGauge(name, help string, delta float64, labels map[string]string) {
+	if m == nil {
+		return // recorder is not initialized
+	}
+
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
+	metric, ok := m.metrics[name]
+	if !ok {
+		klog.V(4).InfoS("Metric not found, registering", "name", name, "labels", labels)
+		m.registerGaugeVec(name, help, getLabelNames(labels))
+		metric = m.metrics[name]
+	}
+
+	metric.(*metrics.GaugeVec).With(metrics.Labels(labels)).Add(delta)
+}
+
+// The Initialize* methods create a series at its zero value without recording
+// an observation. See driver.InitializeStartupMetrics for why that matters:
+// a counter that does not exist reads as "no data" rather than 0, and an alert
+// rule cannot fire on a series that is absent.
+//
+// They are idempotent, and safe to call for a metric that already exists - the
+// underlying With() returns the existing child.
+
+func (m *metricRecorder) InitializeCounter(name, help string, labels map[string]string) {
+	if m == nil {
+		return // recorder is not initialized
+	}
+
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
+	metric, ok := m.metrics[name]
+	if !ok {
+		m.registerCounterVec(name, help, getLabelNames(labels))
+		metric = m.metrics[name]
+	}
+
+	// Add(0) rather than Inc(): this creates the child series and leaves it at
+	// zero, which is the whole point.
+	metric.(*metrics.CounterVec).With(metrics.Labels(labels)).Add(0)
+}
+
+func (m *metricRecorder) InitializeGauge(name, help string, labels map[string]string) {
+	if m == nil {
+		return // recorder is not initialized
+	}
+
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
+	metric, ok := m.metrics[name]
+	if !ok {
+		m.registerGaugeVec(name, help, getLabelNames(labels))
+		metric = m.metrics[name]
+	}
+
+	metric.(*metrics.GaugeVec).With(metrics.Labels(labels)).Add(0)
+}
+
+func (m *metricRecorder) InitializeHistogram(name, help string, labels map[string]string, buckets []float64) {
+	if m == nil {
+		return // recorder is not initialized
+	}
+
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
+	if _, ok := m.metrics[name]; !ok {
+		m.registerHistogramVec(name, help, getLabelNames(labels), buckets)
+	}
+
+	// A HistogramVec child cannot be created without observing, and observing
+	// would put a fake value in the bucket. GetMetricWith creates the child
+	// with zero observations, which is exactly what is wanted here.
+	if hv, ok := m.metrics[name].(*metrics.HistogramVec); ok {
+		_, _ = hv.GetMetricWith(lprom.Labels(labels))
+	}
+}
+
+// RegisterRuntimeCollectors publishes go_* and process_*.
+//
+// NewKubeRegistry builds a bare prometheus.NewRegistry(), which - unlike
+// legacyregistry - registers no runtime collectors, so without this call the
+// endpoint carries no goroutine count and no RSS. Both have been the deciding
+// evidence in past incidents on other components in this fleet (a goroutine
+// leak from an early-returned range, and a per-reconcile cache allocation),
+// and neither is visible from CSI-level metrics alone.
+func (m *metricRecorder) RegisterRuntimeCollectors() {
+	if m == nil {
+		return // recorder is not initialized
+	}
+
+	m.registry.RawMustRegister(
+		collectors.NewGoCollector(),
+		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
+	)
+}
+
+// Gather returns what this recorder currently publishes.
+//
+// A thin passthrough to the registry - the same call the HTTP handler makes -
+// exported so that code outside this package can assert on what it published
+// without reaching into the registry field. Not on any hot path.
+func (m *metricRecorder) Gather() ([]*ldto.MetricFamily, error) {
+	if m == nil {
+		return nil, nil // recorder is not initialized
+	}
+
+	return m.registry.Gather()
+}
+
 // InitializeMetricsHandler starts a new HTTP server to expose the metrics.
 func (m *metricRecorder) InitializeMetricsHandler(address, path string) {
 	if m == nil {
@@ -222,58 +342,4 @@ func getLabelNames(labels map[string]string) []string {
 		names = append(names, n)
 	}
 	return names
-}
-
-type VContainerMetrics struct {
-	Duration *metrics.HistogramVec
-	Total    *metrics.CounterVec
-	Errors   *metrics.CounterVec
-}
-
-// MetricContext indicates the context for OpenStack metrics.
-type MetricContext struct {
-	Start      time.Time
-	Attributes []string
-	Metrics    *VContainerMetrics
-}
-
-// Observe records the request latency and counts the errors.
-func (s *MetricContext) Observe(om *VContainerMetrics, err error) error {
-	if om == nil {
-		// mc.RequestMetrics not set, ignore this request
-		return nil
-	}
-
-	om.Duration.WithLabelValues(s.Attributes...).Observe(
-		time.Since(s.Start).Seconds())
-	om.Total.WithLabelValues(s.Attributes...).Inc()
-	if err != nil {
-		om.Errors.WithLabelValues(s.Attributes...).Inc()
-	}
-	return err
-}
-
-// ObserveRequest records the request latency and counts the errors.
-func (s *MetricContext) ObserveRequest(err error) error {
-	return s.Observe(APIRequestMetrics, err)
-}
-
-// ObserveReconcile records the request reconciliation duration
-func (s *MetricContext) ObserveReconcile(err error) error {
-	return s.Observe(vccmReconcileMetrics, err)
-}
-
-// NewMetricContext creates a new MetricContext.
-func NewMetricContext(resource string, request string) *MetricContext {
-	return &MetricContext{
-		Start:      time.Now(),
-		Attributes: []string{resource + "_" + request},
-	}
-}
-
-func RegisterMetrics(component string) {
-	doRegisterAPIMetrics()
-	if component == "occm" {
-		doRegisterOccmMetrics()
-	}
 }
