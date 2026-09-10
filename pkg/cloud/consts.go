@@ -55,6 +55,31 @@ var (
 		Steps:    12,
 	}
 
+	// Waiting out a transient "volume is busy" rejection on the attach path.
+	//
+	// Its own shape, much shorter than volumeOperationBackoff, because this
+	// wait is not waiting for an operation to COMPLETE - it is waiting for
+	// another operation to release the volume so the attach can be issued at
+	// all.
+	//
+	// Sized from the dev cluster on 10/09/2026: a freshly created volume's
+	// IN-PROCESS rejections spanned about five seconds (three rejections logged
+	// at 09:18:42.6, 09:18:43.6 and 09:18:47.7, then success), so the lock
+	// clears in single-digit seconds. What made the pod wait 39-40s was not the
+	// IaaS but the CO's retry backoff between those rejections.
+	//
+	// 8 polls, 7 sleeps - 1s, 1.4s, 1.96s, 2.74s, 3.84s, 5.38s, 7.53s - for
+	// about 23.9s in total. Several times the observed clear time, and the
+	// bound matters as much as the polls: this wait holds the (volume, node)
+	// inflight entry with NO IaaS operation in flight, so a volume held by
+	// something genuinely stuck has to fall out fast and let the CO retry.
+	// 23.9s is a fraction of the attacher's 6m timeout.
+	volumeBusyBackoff = lwait.Backoff{
+		Duration: 1 * ltime.Second,
+		Factor:   1.4,
+		Steps:    8,
+	}
+
 	// Waiting for a snapshot to go ACTIVE. Its own shape rather than the volume
 	// numbers, because the two ends of this wait pull in opposite directions:
 	//
