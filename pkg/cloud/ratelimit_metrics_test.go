@@ -249,6 +249,97 @@ func TestDoRequestLabelsAMissingStatusAsNone(t *ltesting.T) {
 	}
 }
 
+// respHTTPClient returns a response ALONGSIDE an error, which is the shape of
+// the SDK's generic error path - `return resp, ErrorHandler(resp.Err)` - and
+// the shape the status label depends on.
+type respHTTPClient struct {
+	fakeHTTPClient
+	status int
+}
+
+func (s *respHTTPClient) DoRequest(purl string, preq lsdkClient.IRequest) (*lreq.Response, lsdkErrs.IError) {
+	_, err := s.fakeHTTPClient.DoRequest(purl, preq)
+
+	return &lreq.Response{Response: &lhttp.Response{StatusCode: s.status}}, err
+}
+
+// The case live testing exposed: the SDK's generic error path attaches NO
+// statusCode to the error, only to the response. Reading the status from the
+// error alone labelled the driver's most frequent API error - an attach
+// against a volume in IN-PROCESS state - as "none", the same as a transport
+// failure.
+func TestDoRequestTakesTheStatusFromTheResponseWhenTheErrorHasNone(t *ltesting.T) {
+	lsmetrics.InitializeRecorder()
+
+	client := &throttledHTTPClient{
+		// Error with no statusCode parameter at all, response with 400.
+		inner: &respHTTPClient{
+			fakeHTTPClient: fakeHTTPClient{
+				err: new(lsdkErrs.SdkError).WithErrorCode(lsdkErrs.EcUnexpectedError),
+			},
+			status: lhttp.StatusBadRequest,
+		},
+		limiter: newAdaptiveRateLimiter(),
+	}
+
+	want := map[string]string{
+		"route": "volumes/{id}", "method": "GET",
+		"code": string(lsdkErrs.EcUnexpectedError), "status": "400",
+	}
+	none := map[string]string{
+		"route": "volumes/{id}", "method": "GET",
+		"code": string(lsdkErrs.EcUnexpectedError), "status": "none",
+	}
+	before := counterValue(t, lsmetrics.APIRequestErrors, want)
+	noneBefore := counterValue(t, lsmetrics.APIRequestErrors, none)
+
+	if _, err := client.DoRequest(testVolumeURL, fakeRequest{}); err == nil {
+		t.Fatal("the inner error must be returned")
+	}
+
+	if got := counterValue(t, lsmetrics.APIRequestErrors, want); got != before+1 {
+		t.Errorf("status=400 counter = %v, want %v", got, before+1)
+	}
+	if got := counterValue(t, lsmetrics.APIRequestErrors, none); got != noneBefore {
+		t.Errorf("the error was also counted as status=none (%v); the response carried 400", got)
+	}
+}
+
+// A response object with no embedded HTTP response must not be dereferenced,
+// and must fall through to the error. The SDK's own nil-guard is
+// `resp != nil && resp.Response != nil`, so this shape occurs.
+func TestDoRequestSurvivesAResponseWithNoHTTPResponse(t *ltesting.T) {
+	lsmetrics.InitializeRecorder()
+
+	client := &throttledHTTPClient{
+		inner:   &emptyRespHTTPClient{err: sdkErrWithStatus(lhttp.StatusForbidden, lsdkErrs.EcPermissionDenied)},
+		limiter: newAdaptiveRateLimiter(),
+	}
+
+	labels := map[string]string{
+		"route": "volumes/{id}", "method": "GET",
+		"code": string(lsdkErrs.EcPermissionDenied), "status": "403",
+	}
+	before := counterValue(t, lsmetrics.APIRequestErrors, labels)
+
+	if _, err := client.DoRequest(testVolumeURL, fakeRequest{}); err == nil {
+		t.Fatal("the inner error must be returned")
+	}
+
+	if got := counterValue(t, lsmetrics.APIRequestErrors, labels); got != before+1 {
+		t.Errorf("status fell back to the error = %v, want %v", got, before+1)
+	}
+}
+
+type emptyRespHTTPClient struct {
+	fakeHTTPClient
+	err lsdkErrs.IError
+}
+
+func (s *emptyRespHTTPClient) DoRequest(string, lsdkClient.IRequest) (*lreq.Response, lsdkErrs.IError) {
+	return &lreq.Response{}, s.err
+}
+
 // A shed request never left the process, so it must not be timed: a 0s
 // observation would pull the latency histogram DOWN at the exact moment the
 // driver is most degraded, which is the opposite of what the graph should show.
