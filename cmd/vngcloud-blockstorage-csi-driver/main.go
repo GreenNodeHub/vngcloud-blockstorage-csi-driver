@@ -52,7 +52,11 @@ func main() {
 
 	if options.ServerOptions.HttpEndpoint != "" {
 		r := lsmetrics.InitializeRecorder()
+		r.RegisterRuntimeCollectors()
 		r.InitializeMetricsHandler(options.ServerOptions.HttpEndpoint, "/metrics")
+		// After the handler is up, so a scrape that lands during startup sees
+		// the series rather than an empty endpoint.
+		lsdriver.InitializeStartupMetrics(lsdriver.Mode(options.DriverMode))
 	}
 
 	drv, err := lsdriver.NewDriver(
