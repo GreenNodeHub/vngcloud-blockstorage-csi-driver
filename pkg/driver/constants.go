@@ -132,29 +132,6 @@ const (
 	// VolumeAttributePartition represents key for partition config in VolumeContext
 	// this represents the partition number on a device used to mount
 	VolumeAttributePartition = "partition"
-
-	// Gauge: seconds a (volume, node) pair has been failing to detach, measured
-	// from its first failure. This is the alertable one - "stuck > 30m" - and
-	// the direct equivalent of aws-ebs-csi-driver's
-	// ec2_detach_pending_seconds_total. Only the leader emits it, because only
-	// the leader holds breaker state.
-	MetricDetachPendingSeconds = "vcontainer_csi_volume_detach_pending_seconds"
-
-	// Counter: breaker trips and backoff-step increases, by event reason.
-	MetricDetachBreakerTrips = "vcontainer_csi_detach_breaker_trips_total"
-
-	// Counter: every classified IaaS error, by operation and reason.
-	MetricIaaSErrors = "vcontainer_csi_iaas_errors_total"
-)
-
-// Help strings for the metrics above. These are what an operator reads in a
-// dashboard or an alert, so they are declared beside the names they describe
-// and passed in explicitly - the recorder has no way to know what a metric
-// means, and its old default said "ebs_csi_aws_com metric" for every counter.
-const (
-	MetricDetachPendingSecondsHelp = "seconds a (volume, node) pair has been failing to detach, measured from its first failure"
-	MetricDetachBreakerTripsHelp   = "detach circuit-breaker trips and backoff-step increases, by error reason"
-	MetricIaaSErrorsHelp           = "IaaS errors returned to the driver, by operation and classified reason"
 )
 
 // Supported access modes

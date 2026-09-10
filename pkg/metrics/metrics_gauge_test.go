@@ -11,21 +11,21 @@ func TestSetGaugeThenDelete(t *ltesting.T) {
 	r := InitializeRecorder()
 	labels := map[string]string{"volume_id": "vol-1", "node_id": "ins-1"}
 
-	r.SetGauge("vcontainer_csi_test_pending_seconds", "test gauge help", 42, labels)
-	if got := gaugeValue(t, r, "vcontainer_csi_test_pending_seconds", labels); got != 42 {
+	r.SetGauge("vks_csi_test_pending_seconds", "test gauge help", 42, labels)
+	if got := gaugeValue(t, r, "vks_csi_test_pending_seconds", labels); got != 42 {
 		t.Fatalf("gauge = %v, want 42", got)
 	}
 
 	// Overwriting the same series must replace, not accumulate.
-	r.SetGauge("vcontainer_csi_test_pending_seconds", "test gauge help", 100, labels)
-	if got := gaugeValue(t, r, "vcontainer_csi_test_pending_seconds", labels); got != 100 {
+	r.SetGauge("vks_csi_test_pending_seconds", "test gauge help", 100, labels)
+	if got := gaugeValue(t, r, "vks_csi_test_pending_seconds", labels); got != 100 {
 		t.Fatalf("gauge after re-set = %v, want 100", got)
 	}
 
 	// Deleting must remove the series, otherwise a recovered volume keeps
 	// reporting a stale "stuck for N seconds" forever.
-	r.DeleteGauge("vcontainer_csi_test_pending_seconds", labels)
-	if gaugeExists(t, r, "vcontainer_csi_test_pending_seconds", labels) {
+	r.DeleteGauge("vks_csi_test_pending_seconds", labels)
+	if gaugeExists(t, r, "vks_csi_test_pending_seconds", labels) {
 		t.Fatal("series still present after DeleteGauge")
 	}
 }
@@ -36,10 +36,10 @@ func TestSetGaugeIsIdempotentOnRegistration(t *ltesting.T) {
 	r := InitializeRecorder()
 	labels := map[string]string{"volume_id": "vol-1", "node_id": "ins-1"}
 
-	r.SetGauge("vcontainer_csi_test_twice", "test gauge help", 1, labels)
-	r.SetGauge("vcontainer_csi_test_twice", "test gauge help", 2, labels)
+	r.SetGauge("vks_csi_test_twice", "test gauge help", 1, labels)
+	r.SetGauge("vks_csi_test_twice", "test gauge help", 2, labels)
 
-	if got := gaugeValue(t, r, "vcontainer_csi_test_twice", labels); got != 2 {
+	if got := gaugeValue(t, r, "vks_csi_test_twice", labels); got != 2 {
 		t.Fatalf("gauge = %v, want 2", got)
 	}
 }
@@ -50,7 +50,7 @@ func TestSetGaugeIsIdempotentOnRegistration(t *ltesting.T) {
 // -race.
 func TestSetGaugeConcurrentFirstUse(t *ltesting.T) {
 	r := InitializeRecorder()
-	const name = "vcontainer_csi_test_concurrent_first_use"
+	const name = "vks_csi_test_concurrent_first_use"
 	const n = 50
 	labels := map[string]string{"volume_id": "vol-1", "node_id": "ins-1"}
 

@@ -26,11 +26,11 @@ func TestRegisteredMetricsCarryTheCallersHelpString(t *ltesting.T) {
 	r := InitializeRecorder()
 
 	const (
-		counterName = "vcontainer_csi_test_help_counter_total"
+		counterName = "vks_csi_test_help_counter_total"
 		counterHelp = "test counter help that only this call site could know"
-		gaugeName   = "vcontainer_csi_test_help_gauge"
+		gaugeName   = "vks_csi_test_help_gauge"
 		gaugeHelp   = "test gauge help that only this call site could know"
-		histName    = "vcontainer_csi_test_help_histogram"
+		histName    = "vks_csi_test_help_histogram"
 		histHelp    = "test histogram help that only this call site could know"
 	)
 
