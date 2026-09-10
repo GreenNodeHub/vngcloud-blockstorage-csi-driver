@@ -124,30 +124,10 @@ func waitForVolumeAttachments(pclientset lk8s.Interface, pnodeName string) error
 
 	_, err := informer.AddEventHandler(lcache.ResourceEventHandlerFuncs{
 		DeleteFunc: func(pobj any) {
-			llog.V(5).InfoS("DeleteFunc: VolumeAttachment deleted", "node", pnodeName)
-			va, ok := pobj.(*lstoragev1.VolumeAttachment)
-			if !ok {
-				llog.ErrorS(nil, "DeleteFunc: error asserting object as type VolumeAttachment", "obj", pobj)
-				return
-			}
-			if va.Spec.NodeName == pnodeName {
-				if err := checkVolumeAttachments(pclientset, pnodeName, allAttachmentsDeleted); err != nil {
-					llog.ErrorS(err, "DeleteFunc: error checking VolumeAttachments")
-				}
-			}
+			rescanOnAttachmentEvent(pclientset, pnodeName, allAttachmentsDeleted, pobj, "DeleteFunc")
 		},
 		UpdateFunc: func(poldObj, pnewObj any) {
-			llog.V(5).InfoS("UpdateFunc: VolumeAttachment updated", "node", pnodeName)
-			va, ok := pnewObj.(*lstoragev1.VolumeAttachment)
-			if !ok {
-				llog.ErrorS(nil, "UpdateFunc: error asserting object as type VolumeAttachment", "obj", pnewObj)
-				return
-			}
-			if va.Spec.NodeName == pnodeName {
-				if err := checkVolumeAttachments(pclientset, pnodeName, allAttachmentsDeleted); err != nil {
-					llog.ErrorS(err, "UpdateFunc: error checking VolumeAttachments")
-				}
-			}
+			rescanOnAttachmentEvent(pclientset, pnodeName, allAttachmentsDeleted, pnewObj, "UpdateFunc")
 		},
 	})
 	if err != nil {
@@ -165,6 +145,28 @@ func waitForVolumeAttachments(pclientset lk8s.Interface, pnodeName string) error
 	<-allAttachmentsDeleted.done()
 	llog.InfoS("waitForVolumeAttachments: finished waiting for VolumeAttachments to be deleted. preStopHook completed")
 	return nil
+}
+
+// rescanOnAttachmentEvent re-lists the VolumeAttachments whenever an informer event
+// may concern this node. An object that does not type-assert - a
+// cache.DeletedFinalStateUnknown tombstone, which the informer delivers whenever the
+// watch has to be re-established - is rescanned too: upstream dereferences the failed
+// assertion and panics, while skipping the rescan could park the hook until
+// terminationGracePeriodSeconds expires. The List is what decides, and it is cheap.
+func rescanOnAttachmentEvent(pclientset lk8s.Interface, pnodeName string, psignal *completionSignal, pobj any, psource string) {
+	llog.V(5).InfoS(psource+": VolumeAttachment event received", "node", pnodeName)
+
+	va, ok := pobj.(*lstoragev1.VolumeAttachment)
+	switch {
+	case !ok:
+		llog.InfoS(psource+": object is not a VolumeAttachment, checking VolumeAttachments anyway", "obj", pobj, "node", pnodeName)
+	case va.Spec.NodeName != pnodeName:
+		return
+	}
+
+	if err := checkVolumeAttachments(pclientset, pnodeName, psignal); err != nil {
+		llog.ErrorS(err, psource+": error checking VolumeAttachments")
+	}
 }
 
 func checkVolumeAttachments(pclientset lk8s.Interface, pnodeName string, pallAttachmentsDeleted *completionSignal) error {

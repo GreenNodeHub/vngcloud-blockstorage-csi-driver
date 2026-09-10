@@ -13,6 +13,7 @@ import (
 	lruntime "k8s.io/apimachinery/pkg/runtime"
 	lfake "k8s.io/client-go/kubernetes/fake"
 	ltesting2 "k8s.io/client-go/testing"
+	lcache "k8s.io/client-go/tools/cache"
 )
 
 func nodeWithTaints(pname string, ptaintKeys ...string) *lk8score.Node {
@@ -269,5 +270,40 @@ func TestCheckVolumeAttachmentsReleaseIsIdempotent(t *ltesting.T) {
 	case <-allAttachmentsDeleted.done():
 	default:
 		t.Fatal("hook was never released although no VolumeAttachment belongs to the node")
+	}
+}
+
+func TestRescanOnAttachmentEventIgnoresAnotherNode(t *ltesting.T) {
+	client := lfake.NewSimpleClientset()
+	allAttachmentsDeleted := newCompletionSignal()
+
+	rescanOnAttachmentEvent(client, "test-node", allAttachmentsDeleted, volumeAttachment("va-other-node", "test-node-2"), "TestFunc")
+
+	if listedVolumeAttachments(client) {
+		t.Fatal("an event about another node's VolumeAttachment cost a List")
+	}
+	select {
+	case <-allAttachmentsDeleted.done():
+		t.Fatal("hook was released by an event about another node's VolumeAttachment")
+	default:
+	}
+}
+
+func TestRescanOnAttachmentEventRechecksOnUnexpectedObject(t *ltesting.T) {
+	// A DeletedFinalStateUnknown tombstone arrives instead of the object whenever the
+	// watch is re-established. Upstream dereferences the failed type assertion and
+	// panics; skipping the recheck instead would park the hook until the grace period
+	// expires, so ask the API - the List is what decides.
+	client := lfake.NewSimpleClientset()
+	allAttachmentsDeleted := newCompletionSignal()
+
+	tombstone := lcache.DeletedFinalStateUnknown{Key: "va-test-node"}
+
+	rescanOnAttachmentEvent(client, "test-node", allAttachmentsDeleted, tombstone, "TestFunc")
+
+	select {
+	case <-allAttachmentsDeleted.done():
+	case <-ltime.After(ltime.Second):
+		t.Fatal("hook was not released although no VolumeAttachment is left for the node")
 	}
 }
