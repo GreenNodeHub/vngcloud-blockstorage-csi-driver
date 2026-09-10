@@ -363,14 +363,14 @@ func (s *throttledHTTPClient) DoRequest(purl string, preq lsdkClient.IRequest) (
 		// Record the truth the SDK is about to mask: this is a 429, not a 403.
 		llog.InfoS("[WARN] - rateLimiter: request throttled by vServer (HTTP 429, reported as PermissionDenied)",
 			"url", purl, "method", method)
-		s.recordOutcome(route, method, lsmetrics.OutcomeThrottled, elapsed, sdkErr)
+		s.recordOutcome(route, method, lsmetrics.OutcomeThrottled, elapsed, resp, sdkErr)
 
 	case isServerError(sdkErr):
 		// Backpressure - see the policy comment on
 		// rateLimitServerErrorDecreaseFactor. Logging happens inside
 		// onServerError, only when the rate actually moves.
 		s.limiter.onServerError(ltime.Now())
-		s.recordOutcome(route, method, lsmetrics.OutcomeError, elapsed, sdkErr)
+		s.recordOutcome(route, method, lsmetrics.OutcomeError, elapsed, resp, sdkErr)
 
 	default:
 		// Anything else - a success, a 404, a genuine 403 - is evidence we are
@@ -383,9 +383,9 @@ func (s *throttledHTTPClient) DoRequest(purl string, preq lsdkClient.IRequest) (
 		// we took. Conflating the two would report every non-throttle,
 		// non-5xx failure as a success.
 		if sdkErr != nil {
-			s.recordOutcome(route, method, lsmetrics.OutcomeError, elapsed, sdkErr)
+			s.recordOutcome(route, method, lsmetrics.OutcomeError, elapsed, resp, sdkErr)
 		} else {
-			s.recordOutcome(route, method, lsmetrics.OutcomeOK, elapsed, nil)
+			s.recordOutcome(route, method, lsmetrics.OutcomeOK, elapsed, resp, nil)
 		}
 	}
 
@@ -407,7 +407,8 @@ func (s *throttledHTTPClient) recordShed(proute, pmethod string) {
 
 // recordOutcome publishes the per-call series for one completed round trip.
 func (s *throttledHTTPClient) recordOutcome(
-	proute, pmethod, poutcome string, pelapsed ltime.Duration, psdkErr lsdkErrs.IError,
+	proute, pmethod, poutcome string, pelapsed ltime.Duration,
+	presp *lreq.Response, psdkErr lsdkErrs.IError,
 ) {
 	labels := map[string]string{"route": proute, "method": pmethod}
 
@@ -442,7 +443,7 @@ func (s *throttledHTTPClient) recordOutcome(
 			lsmetrics.APIRequestErrors, lsmetrics.APIRequestErrorsHelp, map[string]string{
 				"route": proute, "method": pmethod,
 				"code":   string(psdkErr.GetErrorCode()),
-				"status": responseStatusLabel(psdkErr),
+				"status": responseStatusLabel(presp, psdkErr),
 			})
 	}
 
@@ -460,14 +461,42 @@ func (s *throttledHTTPClient) publishLimiterQPS() {
 		lsmetrics.RateLimiterQPS, lsmetrics.RateLimiterQPSHelp, s.limiter.currentQPS(), nil)
 }
 
-// responseStatusLabel renders the HTTP status the SDK recorded, or "none" when
+// responseStatusLabel renders the HTTP status of a failed call, or "none" when
 // no response arrived at all.
 //
-// "none" is a real and important value, not a fallback: statusCode is 0 when
-// the request never reached a server, which is how a DNS failure, a refused
-// connection and the 120s client timeout all present. Rendering those as "0"
-// would read as a status code; rendering them as "" would be an empty label.
-func responseStatusLabel(perr lsdkErrs.IError) string {
+// The RESPONSE is consulted before the error, because the error usually does
+// not carry the status. The SDK stamps statusCode into the error's parameters
+// for exactly five statuses - 401, 403, 429, 500 and 503 (client/http.go) -
+// and every other non-ok status takes the generic
+// `return resp, ErrorHandler(resp.Err)` path, which attaches neither a
+// specific error code nor a status.
+//
+// That generic path is not an edge case; it is the common one. Measured on the
+// dev cluster on 10/09/2026: the attach retries against a volume in IN-PROCESS
+// state - the single most frequent API error this driver sees - all arrived
+// with code "UnknownError" and no status, even though the driver's own log
+// showed the SDK resolving VngCloudVServerVolumeInProcess one layer up. Reading
+// the status only from the error labelled that whole class "none", which is
+// what a transport failure looks like, so the two became indistinguishable.
+//
+// The same path does return the response, so the status is available - just not
+// where the first version looked.
+//
+// "none" is a real and important value, not a fallback: it is how a refused
+// connection, a DNS failure and the 120s client timeout all present, and
+// rendering those as "0" would read as an HTTP code.
+func responseStatusLabel(presp *lreq.Response, perr lsdkErrs.IError) string {
+	// resp.Response is checked as well as resp: the SDK's own nil-guard is
+	// `resp != nil && resp.Response != nil`, so a non-nil wrapper around no
+	// HTTP response does occur.
+	if presp != nil && presp.Response != nil && presp.StatusCode != 0 {
+		return lstrconv.Itoa(presp.StatusCode)
+	}
+
+	if perr == nil {
+		return "none"
+	}
+
 	raw, ok := perr.GetParameters()["statusCode"]
 	if !ok {
 		return "none"
