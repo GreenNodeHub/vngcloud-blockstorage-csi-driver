@@ -46,7 +46,7 @@ const (
 	APIRequestsHelp = "vServer API calls, by normalised route, method and outcome"
 
 	APIRequestErrors     = "vks_csi_api_request_errors_total"
-	APIRequestErrorsHelp = "vServer API calls that failed, by normalised route, method and SDK error code"
+	APIRequestErrorsHelp = "vServer API calls that failed, by normalised route, method, SDK error code and HTTP status"
 
 	APIRequestThrottles     = "vks_csi_api_request_throttles_total"
 	APIRequestThrottlesHelp = "vServer API calls rejected with HTTP 429, by normalised route and method"

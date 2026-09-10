@@ -144,9 +144,108 @@ func TestDoRequestCountsNonThrottleFailuresAsErrors(t *ltesting.T) {
 	}
 
 	if got := counterValue(t, lsmetrics.APIRequestErrors, map[string]string{
-		"route": "volumes/{id}", "method": "GET", "code": string(lsdkErrs.EcPermissionDenied),
+		"route": "volumes/{id}", "method": "GET",
+		"code": string(lsdkErrs.EcPermissionDenied), "status": "403",
 	}); got < 1 {
 		t.Errorf("error counter for the SDK code = %v, want >= 1", got)
+	}
+}
+
+// The status label exists because the SDK code alone is often UnknownError -
+// measured live, all three attach retries against a volume in IN-PROCESS
+// state reported that one code. Without the status, a 429, a 409 and a 500
+// collapse into one series.
+func TestDoRequestRecordsTheHTTPStatusAlongsideTheCode(t *ltesting.T) {
+	lsmetrics.InitializeRecorder()
+
+	for _, tc := range []struct {
+		name       string
+		status     int
+		wantStatus string
+	}{
+		{"a 409 keeps its status", lhttp.StatusConflict, "409"},
+		{"a 500 keeps its status", lhttp.StatusInternalServerError, "500"},
+	} {
+		t.Run(tc.name, func(t *ltesting.T) {
+			client := &throttledHTTPClient{
+				inner:   &fakeHTTPClient{err: sdkErrWithStatus(tc.status, lsdkErrs.EcUnexpectedError)},
+				limiter: newAdaptiveRateLimiter(),
+			}
+
+			labels := map[string]string{
+				"route": "volumes/{id}", "method": "GET",
+				"code": string(lsdkErrs.EcUnexpectedError), "status": tc.wantStatus,
+			}
+			before := counterValue(t, lsmetrics.APIRequestErrors, labels)
+
+			if _, err := client.DoRequest(testVolumeURL, fakeRequest{}); err == nil {
+				t.Fatal("the inner error must be returned")
+			}
+
+			if got := counterValue(t, lsmetrics.APIRequestErrors, labels); got != before+1 {
+				t.Errorf("counter for status %s = %v, want %v", tc.wantStatus, got, before+1)
+			}
+		})
+	}
+}
+
+// A transport-level failure never gets a status, and "none" has to be
+// distinguishable from a real code - it is how a refused connection, a DNS
+// failure and the 120s client timeout all present.
+func TestDoRequestLabelsAMissingStatusAsNone(t *ltesting.T) {
+	lsmetrics.InitializeRecorder()
+
+	for _, tc := range []struct {
+		name string
+		err  lsdkErrs.IError
+	}{
+		{
+			// The shape the SDK actually produces for a transport-level
+			// failure: the parameter IS present and it is zero. Verified
+			// against the SDK - WithKVparameters stores the zero rather than
+			// dropping it - so this, not an absent parameter, is the case that
+			// matters: a refused connection, a DNS failure and the 120s client
+			// timeout all land here.
+			name: "statusCode present and zero",
+			err:  sdkErrWithStatus(0, lsdkErrs.EcUnexpectedError),
+		},
+		{
+			name: "statusCode absent entirely",
+			err:  new(lsdkErrs.SdkError).WithErrorCode(lsdkErrs.EcUnexpectedError),
+		},
+	} {
+		t.Run(tc.name, func(t *ltesting.T) {
+			client := &throttledHTTPClient{
+				inner:   &fakeHTTPClient{err: tc.err},
+				limiter: newAdaptiveRateLimiter(),
+			}
+
+			none := map[string]string{
+				"route": "volumes/{id}", "method": "GET",
+				"code": string(lsdkErrs.EcUnexpectedError), "status": "none",
+			}
+			zero := map[string]string{
+				"route": "volumes/{id}", "method": "GET",
+				"code": string(lsdkErrs.EcUnexpectedError), "status": "0",
+			}
+
+			before := counterValue(t, lsmetrics.APIRequestErrors, none)
+			zeroBefore := counterValue(t, lsmetrics.APIRequestErrors, zero)
+
+			if _, err := client.DoRequest(testVolumeURL, fakeRequest{}); err == nil {
+				t.Fatal("the inner error must be returned")
+			}
+
+			if got := counterValue(t, lsmetrics.APIRequestErrors, none); got != before+1 {
+				t.Errorf("counter for a status-less error = %v, want %v", got, before+1)
+			}
+
+			// "0" must never appear as a status: on a dashboard it reads as an
+			// HTTP code, and there is no such code.
+			if got := counterValue(t, lsmetrics.APIRequestErrors, zero); got != zeroBefore {
+				t.Errorf("a status=\"0\" series was written (%v); 0 is not a status", got)
+			}
+		})
 	}
 }
 
