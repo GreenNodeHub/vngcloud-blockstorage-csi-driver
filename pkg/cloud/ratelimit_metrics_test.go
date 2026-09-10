@@ -3,14 +3,13 @@ package cloud
 import (
 	lhttp "net/http"
 	ltesting "testing"
+	ltime "time"
 
 	lreq "github.com/imroc/req/v3"
+	ldto "github.com/prometheus/client_model/go"
 	lsdkClient "github.com/vngcloud/vngcloud-go-sdk/v2/vngcloud/client"
 	lsdkErrs "github.com/vngcloud/vngcloud-go-sdk/v2/vngcloud/sdk_error"
 	lrate "golang.org/x/time/rate"
-	ltime "time"
-
-	ldto "github.com/prometheus/client_model/go"
 
 	lsmetrics "github.com/vngcloud/vngcloud-blockstorage-csi-driver/pkg/metrics"
 )
@@ -41,7 +40,7 @@ func TestDoRequestRecordsRealDuration(t *ltesting.T) {
 		limiter: newAdaptiveRateLimiter(),
 	}
 
-	labels := map[string]string{"route": "volumes/{id}", "method": "GET"}
+	labels := map[string]string{lsmetrics.LabelRoute: routeVolumeByID, lsmetrics.LabelMethod: lhttp.MethodGet}
 	sumBefore := histogramSum(t, lsmetrics.APIRequestDuration, labels)
 
 	if _, err := client.DoRequest(testVolumeURL, fakeRequest{}); err != nil {
@@ -60,7 +59,7 @@ func TestDoRequestRecordsSuccess(t *ltesting.T) {
 	client := &throttledHTTPClient{inner: &fakeHTTPClient{}, limiter: newAdaptiveRateLimiter()}
 
 	before := counterValue(t, lsmetrics.APIRequests,
-		map[string]string{"route": "volumes/{id}", "method": "GET", "outcome": lsmetrics.OutcomeOK})
+		map[string]string{lsmetrics.LabelRoute: routeVolumeByID, lsmetrics.LabelMethod: lhttp.MethodGet, lsmetrics.LabelOutcome: lsmetrics.OutcomeOK})
 	errsBefore := familySampleCount(t, lsmetrics.APIRequestErrors)
 
 	if _, err := client.DoRequest(testVolumeURL, fakeRequest{}); err != nil {
@@ -68,13 +67,13 @@ func TestDoRequestRecordsSuccess(t *ltesting.T) {
 	}
 
 	after := counterValue(t, lsmetrics.APIRequests,
-		map[string]string{"route": "volumes/{id}", "method": "GET", "outcome": lsmetrics.OutcomeOK})
+		map[string]string{lsmetrics.LabelRoute: routeVolumeByID, lsmetrics.LabelMethod: lhttp.MethodGet, lsmetrics.LabelOutcome: lsmetrics.OutcomeOK})
 	if after != before+1 {
 		t.Errorf("ok counter = %v, want %v", after, before+1)
 	}
 
 	if got := histogramCount(t, lsmetrics.APIRequestDuration,
-		map[string]string{"route": "volumes/{id}", "method": "GET"}); got == 0 {
+		map[string]string{lsmetrics.LabelRoute: routeVolumeByID, lsmetrics.LabelMethod: lhttp.MethodGet}); got == 0 {
 		t.Error("duration histogram recorded no observation for a successful call")
 	}
 
@@ -93,7 +92,7 @@ func TestDoRequestRecordsThrottle(t *ltesting.T) {
 		limiter: newAdaptiveRateLimiter(),
 	}
 
-	labels := map[string]string{"route": "volumes/{id}", "method": "GET"}
+	labels := map[string]string{lsmetrics.LabelRoute: routeVolumeByID, lsmetrics.LabelMethod: lhttp.MethodGet}
 	before := counterValue(t, lsmetrics.APIRequestThrottles, labels)
 
 	if _, err := client.DoRequest(testVolumeURL, fakeRequest{}); err == nil {
@@ -105,7 +104,7 @@ func TestDoRequestRecordsThrottle(t *ltesting.T) {
 	}
 
 	if got := counterValue(t, lsmetrics.APIRequests, map[string]string{
-		"route": "volumes/{id}", "method": "GET", "outcome": lsmetrics.OutcomeThrottled,
+		lsmetrics.LabelRoute: routeVolumeByID, lsmetrics.LabelMethod: lhttp.MethodGet, lsmetrics.LabelOutcome: lsmetrics.OutcomeThrottled,
 	}); got < 1 {
 		t.Errorf("throttled outcome counter = %v, want >= 1", got)
 	}
@@ -124,10 +123,10 @@ func TestDoRequestCountsNonThrottleFailuresAsErrors(t *ltesting.T) {
 	}
 
 	okLabels := map[string]string{
-		"route": "volumes/{id}", "method": "GET", "outcome": lsmetrics.OutcomeOK,
+		lsmetrics.LabelRoute: routeVolumeByID, lsmetrics.LabelMethod: lhttp.MethodGet, lsmetrics.LabelOutcome: lsmetrics.OutcomeOK,
 	}
 	errLabels := map[string]string{
-		"route": "volumes/{id}", "method": "GET", "outcome": lsmetrics.OutcomeError,
+		lsmetrics.LabelRoute: routeVolumeByID, lsmetrics.LabelMethod: lhttp.MethodGet, lsmetrics.LabelOutcome: lsmetrics.OutcomeError,
 	}
 	okBefore := counterValue(t, lsmetrics.APIRequests, okLabels)
 	errBefore := counterValue(t, lsmetrics.APIRequests, errLabels)
@@ -144,8 +143,8 @@ func TestDoRequestCountsNonThrottleFailuresAsErrors(t *ltesting.T) {
 	}
 
 	if got := counterValue(t, lsmetrics.APIRequestErrors, map[string]string{
-		"route": "volumes/{id}", "method": "GET",
-		"code": string(lsdkErrs.EcPermissionDenied), "status": "403",
+		lsmetrics.LabelRoute: routeVolumeByID, lsmetrics.LabelMethod: lhttp.MethodGet,
+		lsmetrics.LabelCode: string(lsdkErrs.EcPermissionDenied), lsmetrics.LabelStatus: "403",
 	}); got < 1 {
 		t.Errorf("error counter for the SDK code = %v, want >= 1", got)
 	}
@@ -173,8 +172,8 @@ func TestDoRequestRecordsTheHTTPStatusAlongsideTheCode(t *ltesting.T) {
 			}
 
 			labels := map[string]string{
-				"route": "volumes/{id}", "method": "GET",
-				"code": string(lsdkErrs.EcUnexpectedError), "status": tc.wantStatus,
+				lsmetrics.LabelRoute: routeVolumeByID, lsmetrics.LabelMethod: lhttp.MethodGet,
+				lsmetrics.LabelCode: string(lsdkErrs.EcUnexpectedError), lsmetrics.LabelStatus: tc.wantStatus,
 			}
 			before := counterValue(t, lsmetrics.APIRequestErrors, labels)
 
@@ -221,12 +220,12 @@ func TestDoRequestLabelsAMissingStatusAsNone(t *ltesting.T) {
 			}
 
 			none := map[string]string{
-				"route": "volumes/{id}", "method": "GET",
-				"code": string(lsdkErrs.EcUnexpectedError), "status": "none",
+				lsmetrics.LabelRoute: routeVolumeByID, lsmetrics.LabelMethod: lhttp.MethodGet,
+				lsmetrics.LabelCode: string(lsdkErrs.EcUnexpectedError), lsmetrics.LabelStatus: lsmetrics.StatusNone,
 			}
 			zero := map[string]string{
-				"route": "volumes/{id}", "method": "GET",
-				"code": string(lsdkErrs.EcUnexpectedError), "status": "0",
+				lsmetrics.LabelRoute: routeVolumeByID, lsmetrics.LabelMethod: lhttp.MethodGet,
+				lsmetrics.LabelCode: string(lsdkErrs.EcUnexpectedError), lsmetrics.LabelStatus: "0",
 			}
 
 			before := counterValue(t, lsmetrics.APIRequestErrors, none)
@@ -283,12 +282,12 @@ func TestDoRequestTakesTheStatusFromTheResponseWhenTheErrorHasNone(t *ltesting.T
 	}
 
 	want := map[string]string{
-		"route": "volumes/{id}", "method": "GET",
-		"code": string(lsdkErrs.EcUnexpectedError), "status": "400",
+		lsmetrics.LabelRoute: routeVolumeByID, lsmetrics.LabelMethod: lhttp.MethodGet,
+		lsmetrics.LabelCode: string(lsdkErrs.EcUnexpectedError), lsmetrics.LabelStatus: "400",
 	}
 	none := map[string]string{
-		"route": "volumes/{id}", "method": "GET",
-		"code": string(lsdkErrs.EcUnexpectedError), "status": "none",
+		lsmetrics.LabelRoute: routeVolumeByID, lsmetrics.LabelMethod: lhttp.MethodGet,
+		lsmetrics.LabelCode: string(lsdkErrs.EcUnexpectedError), lsmetrics.LabelStatus: lsmetrics.StatusNone,
 	}
 	before := counterValue(t, lsmetrics.APIRequestErrors, want)
 	noneBefore := counterValue(t, lsmetrics.APIRequestErrors, none)
@@ -317,8 +316,8 @@ func TestDoRequestSurvivesAResponseWithNoHTTPResponse(t *ltesting.T) {
 	}
 
 	labels := map[string]string{
-		"route": "volumes/{id}", "method": "GET",
-		"code": string(lsdkErrs.EcPermissionDenied), "status": "403",
+		lsmetrics.LabelRoute: routeVolumeByID, lsmetrics.LabelMethod: lhttp.MethodGet,
+		lsmetrics.LabelCode: string(lsdkErrs.EcPermissionDenied), lsmetrics.LabelStatus: "403",
 	}
 	before := counterValue(t, lsmetrics.APIRequestErrors, labels)
 
@@ -358,7 +357,7 @@ func TestDoRequestShedIsCountedButNotTimed(t *ltesting.T) {
 		t.Fatal("setup: the first token must be available")
 	}
 
-	labels := map[string]string{"route": "volumes/{id}", "method": "GET"}
+	labels := map[string]string{lsmetrics.LabelRoute: routeVolumeByID, lsmetrics.LabelMethod: lhttp.MethodGet}
 	shedBefore := counterValue(t, lsmetrics.APIRequestsShed, labels)
 	durBefore := histogramCount(t, lsmetrics.APIRequestDuration, labels)
 

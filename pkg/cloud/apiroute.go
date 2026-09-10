@@ -1,7 +1,10 @@
 package cloud
 
 import (
+	lhttp "net/http"
 	lstr "strings"
+
+	lsmetrics "github.com/vngcloud/vngcloud-blockstorage-csi-driver/pkg/metrics"
 )
 
 // Turning a vServer URL into a metric label.
@@ -33,9 +36,21 @@ import (
 // A whitelist can only be wrong when the SDK adds a new static segment, and
 // then it is wrong in the safe direction: the new segment reads as "{id}",
 // cardinality stays bounded, and the coarser route is visible on any dashboard.
+// Segments and route strings that appear more than once, named so a typo in
+// one place cannot silently produce a route the whitelist then fails to match.
+const (
+	segVolumes     = "volumes"
+	segVolumeTypes = "volume_types"
+
+	routeVolumes        = segVolumes
+	routeVolumeByID     = segVolumes + "/" + routeIDPlaceholder
+	routeVolumeTypes    = segVolumeTypes
+	routeVolumeTypeByID = segVolumeTypes + "/" + routeIDPlaceholder
+)
+
 var staticRouteSegments = map[string]struct{}{
 	// volume/v2
-	"volumes":            {},
+	segVolumes:           {},
 	"servers":            {},
 	"snapshots":          {},
 	"resize":             {},
@@ -47,7 +62,7 @@ var staticRouteSegments = map[string]struct{}{
 	"attach": {},
 	"detach": {},
 	// volume/v1
-	"volume_types":      {},
+	segVolumeTypes:      {},
 	"volume_default_id": {},
 	"volume_type_zones": {},
 	// portal/v1 + portal/v2
@@ -63,7 +78,7 @@ const routeIDPlaceholder = "{id}"
 
 // routeUnknown is the label for a URL that contains no recognised segment at
 // all. It exists so an unexpected URL shape cannot mint a new series.
-const routeUnknown = "unknown"
+const routeUnknown = lsmetrics.ValueUnknown
 
 // maxRouteSegments is one more than the longest route the SDK builds
 // ("volumes/{id}/servers/{id}/attach" is 5), leaving room for one added
@@ -156,24 +171,24 @@ type RouteMethod struct {
 // change-device-type are PUT rather than POST.
 func KnownAPIRoutes() []RouteMethod {
 	return []RouteMethod{
-		{"volumes", "POST"},                         // CreateBlockVolume
-		{"volumes", "GET"},                          // ListBlockVolumes
-		{"volumes/{id}", "GET"},                     // GetBlockVolumeById
-		{"volumes/{id}", "DELETE"},                  // DeleteBlockVolumeById
-		{"volumes/{id}/resize", "PUT"},              // ResizeBlockVolumeById
-		{"volumes/{id}/snapshots", "POST"},          // CreateSnapshotByBlockVolumeId
-		{"volumes/{id}/snapshots", "GET"},           // ListSnapshotsByBlockVolumeId
-		{"volumes/{id}/snapshots/{id}", "DELETE"},   // DeleteSnapshotById
-		{"volumes/{id}/mapping", "GET"},             // GetUnderBlockVolumeId
-		{"volumes/{id}/change-device-type", "PUT"},  // MigrateBlockVolumeById
-		{"volumes/{id}/servers/{id}/attach", "PUT"}, // AttachBlockVolume
-		{"volumes/{id}/servers/{id}/detach", "PUT"}, // DetachBlockVolume
-		{"servers/{id}", "GET"},                     // GetServerById
-		{"volume_types/{id}", "GET"},                // GetVolumeTypeById
-		{"volume_default_id", "GET"},                // GetDefaultVolumeType
-		{"volume_type_zones", "GET"},                // GetVolumeTypeZones
-		{"volume_types", "GET"},                     // GetListVolumeTypes
-		{"zones", "GET"},                            // ListZones
-		{"projects/{id}/detail", "GET"},             // GetPortalInfo
+		{routeVolumes, lhttp.MethodPost},                                                  // CreateBlockVolume
+		{routeVolumes, lhttp.MethodGet},                                                   // ListBlockVolumes
+		{routeVolumeByID, lhttp.MethodGet},                                                // GetBlockVolumeById
+		{routeVolumeByID, lhttp.MethodDelete},                                             // DeleteBlockVolumeById
+		{routeVolumeByID + "/resize", lhttp.MethodPut},                                    // ResizeBlockVolumeById
+		{routeVolumeByID + "/snapshots", lhttp.MethodPost},                                // CreateSnapshotByBlockVolumeId
+		{routeVolumeByID + "/snapshots", lhttp.MethodGet},                                 // ListSnapshotsByBlockVolumeId
+		{routeVolumeByID + "/snapshots/" + routeIDPlaceholder, lhttp.MethodDelete},        // DeleteSnapshotById
+		{routeVolumeByID + "/mapping", lhttp.MethodGet},                                   // GetUnderBlockVolumeId
+		{routeVolumeByID + "/change-device-type", lhttp.MethodPut},                        // MigrateBlockVolumeById
+		{routeVolumeByID + "/servers/" + routeIDPlaceholder + "/attach", lhttp.MethodPut}, // AttachBlockVolume
+		{routeVolumeByID + "/servers/" + routeIDPlaceholder + "/detach", lhttp.MethodPut}, // DetachBlockVolume
+		{"servers/" + routeIDPlaceholder, lhttp.MethodGet},                                // GetServerById
+		{routeVolumeTypeByID, lhttp.MethodGet},                                            // GetVolumeTypeById
+		{"volume_default_id", lhttp.MethodGet},                                            // GetDefaultVolumeType
+		{"volume_type_zones", lhttp.MethodGet},                                            // GetVolumeTypeZones
+		{routeVolumeTypes, lhttp.MethodGet},                                               // GetListVolumeTypes
+		{"zones", lhttp.MethodGet},                                                        // ListZones
+		{"projects/" + routeIDPlaceholder + "/detail", lhttp.MethodGet},                   // GetPortalInfo
 	}
 }
