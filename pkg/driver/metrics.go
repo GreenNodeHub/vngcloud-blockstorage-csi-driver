@@ -26,7 +26,7 @@ func metricsInterceptor(
 	pctx lctx.Context, preq any, pinfo *lgrpc.UnaryServerInfo, phandler lgrpc.UnaryHandler,
 ) (any, error) {
 	op := rpcOperationLabel(pinfo.FullMethod)
-	labels := map[string]string{"op": op}
+	labels := map[string]string{lsmetrics.LabelOp: op}
 
 	lsmetrics.Recorder().AddGauge(lsmetrics.OperationsInFlight, lsmetrics.OperationsInFlightHelp, 1, labels)
 	defer lsmetrics.Recorder().AddGauge(lsmetrics.OperationsInFlight, lsmetrics.OperationsInFlightHelp, -1, labels)
@@ -42,7 +42,7 @@ func metricsInterceptor(
 	lsmetrics.Recorder().ObserveHistogram(
 		lsmetrics.OperationDuration, lsmetrics.OperationDurationHelp,
 		ltime.Since(start).Seconds(),
-		map[string]string{"op": op, "outcome": outcome},
+		map[string]string{lsmetrics.LabelOp: op, lsmetrics.LabelOutcome: outcome},
 		lsmetrics.OperationDurationBuckets,
 	)
 
@@ -57,7 +57,7 @@ func rpcOperationLabel(pfullMethod string) string {
 		return pfullMethod[i+1:]
 	}
 
-	return "unknown"
+	return lsmetrics.ValueUnknown
 }
 
 // seriesKind says which recorder Initialize* call creates a spec.
@@ -90,7 +90,7 @@ func startupSeries(pmode Mode) []seriesSpec {
 
 	// Every process that talks to vServer, in any mode, makes API calls.
 	for _, rm := range lscloud.KnownAPIRoutes() {
-		labels := map[string]string{"route": rm.Route, "method": rm.Method}
+		labels := map[string]string{lsmetrics.LabelRoute: rm.Route, lsmetrics.LabelMethod: rm.Method}
 
 		specs = append(specs,
 			seriesSpec{seriesHistogram, lsmetrics.APIRequestDuration, lsmetrics.APIRequestDurationHelp,
@@ -107,7 +107,10 @@ func startupSeries(pmode Mode) []seriesSpec {
 		} {
 			specs = append(specs, seriesSpec{
 				Kind: seriesCounter, Name: lsmetrics.APIRequests, Help: lsmetrics.APIRequestsHelp,
-				Labels: map[string]string{"route": rm.Route, "method": rm.Method, "outcome": outcome},
+				Labels: map[string]string{
+					lsmetrics.LabelRoute: rm.Route, lsmetrics.LabelMethod: rm.Method,
+					lsmetrics.LabelOutcome: outcome,
+				},
 			})
 		}
 	}
@@ -119,13 +122,14 @@ func startupSeries(pmode Mode) []seriesSpec {
 	for _, reason := range lscloud.AllErrorReasons() {
 		specs = append(specs, seriesSpec{
 			Kind: seriesCounter, Name: lsmetrics.DetachBreakerTrips,
-			Help: lsmetrics.DetachBreakerTripsHelp, Labels: map[string]string{"reason": reason},
+			Help:   lsmetrics.DetachBreakerTripsHelp,
+			Labels: map[string]string{lsmetrics.LabelReason: reason},
 		})
 
-		for _, op := range []string{"create", "attach", "detach"} {
+		for _, op := range []string{lsmetrics.OpCreate, lsmetrics.OpAttach, lsmetrics.OpDetach} {
 			specs = append(specs, seriesSpec{
 				Kind: seriesCounter, Name: lsmetrics.IaaSErrors, Help: lsmetrics.IaaSErrorsHelp,
-				Labels: map[string]string{"op": op, "reason": reason},
+				Labels: map[string]string{lsmetrics.LabelOp: op, lsmetrics.LabelReason: reason},
 			})
 		}
 	}

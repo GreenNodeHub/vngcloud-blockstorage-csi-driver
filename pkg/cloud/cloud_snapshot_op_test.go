@@ -4,10 +4,9 @@ import (
 	lctx "context"
 	lerrors "errors"
 	lfmt "fmt"
+	lslices "slices"
 	ltesting "testing"
 	ltime "time"
-
-	lslices "slices"
 
 	lsdkClientV2 "github.com/vngcloud/vngcloud-go-sdk/v2/client"
 	lsdkEntity "github.com/vngcloud/vngcloud-go-sdk/v2/vngcloud/entity"

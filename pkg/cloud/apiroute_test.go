@@ -20,49 +20,49 @@ func TestNormalizeAPIRouteCollapsesIdentifiers(t *ltesting.T) {
 		{
 			name: "create volume",
 			url:  base + "proj-8ff1/volumes",
-			want: "volumes",
+			want: routeVolumes,
 		},
 		{
 			name: "get one volume",
 			url:  base + "proj-8ff1/volumes/vol-4c2b1e0a-6f1d-4a2b",
-			want: "volumes/{id}",
+			want: routeVolumeByID,
 		},
 		{
 			name: "attach is a five-segment path with two ids",
 			url:  base + "proj-8ff1/volumes/vol-4c2b/servers/ins-9a7f/attach",
-			want: "volumes/{id}/servers/{id}/attach",
+			want: routeVolumeByID + "/servers/" + routeIDPlaceholder + "/attach",
 		},
 		{
 			name: "detach",
 			url:  base + "proj-8ff1/volumes/vol-4c2b/servers/ins-9a7f/detach",
-			want: "volumes/{id}/servers/{id}/detach",
+			want: routeVolumeByID + "/servers/" + routeIDPlaceholder + "/detach",
 		},
 		{
 			name: "list query is dropped, page numbers must not become labels",
 			url:  base + "proj-8ff1/volumes?page=3&size=100&name=pvc-abc",
-			want: "volumes",
+			want: routeVolumes,
 		},
 		{
 			name: "snapshot of a volume",
 			url:  base + "proj-8ff1/volumes/vol-4c2b/snapshots/snap-77",
-			want: "volumes/{id}/snapshots/{id}",
+			want: routeVolumeByID + "/snapshots/" + routeIDPlaceholder,
 		},
 		{
 			name: "resize",
 			url:  base + "proj-8ff1/volumes/vol-4c2b/resize",
-			want: "volumes/{id}/resize",
+			want: routeVolumeByID + "/resize",
 		},
 		{
 			name: "migrate keeps its hyphenated segment",
 			url:  base + "proj-8ff1/volumes/vol-4c2b/change-device-type",
-			want: "volumes/{id}/change-device-type",
+			want: routeVolumeByID + "/change-device-type",
 		},
 		{
 			// The case that rules out any positional scheme: the SDK puts a
 			// zone ID BEFORE the static segment here.
 			name: "volume types has an id before the static segment",
 			url:  base + "proj-8ff1/zone-hcm3a/volume_types",
-			want: "volume_types",
+			want: routeVolumeTypes,
 		},
 		{
 			name: "portal info",
@@ -72,17 +72,17 @@ func TestNormalizeAPIRouteCollapsesIdentifiers(t *ltesting.T) {
 		{
 			name: "trailing slash does not add a segment",
 			url:  base + "proj-8ff1/volumes/",
-			want: "volumes",
+			want: routeVolumes,
 		},
 		{
 			name: "doubled slash does not add a segment",
 			url:  base + "proj-8ff1//volumes",
-			want: "volumes",
+			want: routeVolumes,
 		},
 		{
 			name: "a path-only url still normalises",
 			url:  "/proj-8ff1/volumes/vol-4c2b",
-			want: "volumes/{id}",
+			want: routeVolumeByID,
 		},
 		{
 			name: "no path at all",
@@ -109,7 +109,7 @@ func TestNormalizeAPIRouteCollapsesIdentifiers(t *ltesting.T) {
 		{
 			name: "a fragment is dropped like a query",
 			url:  base + "proj-8ff1/volumes#anchor",
-			want: "volumes",
+			want: routeVolumes,
 		},
 	} {
 		t.Run(tc.name, func(t *ltesting.T) {
@@ -131,7 +131,7 @@ func TestNormalizeAPIRouteIsIdenticalForTwoDifferentVolumes(t *ltesting.T) {
 	if a != b {
 		t.Fatalf("two volumes produced different routes: %q vs %q", a, b)
 	}
-	if a != "volumes/{id}" {
+	if a != routeVolumeByID {
 		t.Fatalf("route = %q, want volumes/{id}", a)
 	}
 }
