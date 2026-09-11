@@ -251,14 +251,60 @@ func (s *cloud) AttachVolume(pctx lctx.Context, pinstanceId, pvolumeId string) (
 			// Goal already reached - fall through to the wait to confirm IN-USE.
 		case lsdkErrs.EcVServerVolumeInProcess:
 			// The IaaS REJECTED the attach because another operation owns the
-			// volume - nothing was queued, so waiting here would poll for an
-			// attach nobody is performing, burning the whole sidecar budget
-			// while holding the inflight lock. Return instead; the CO retries
-			// and the next RPC re-reads state and re-issues.
-			llog.InfoS("[INFO] - AttachVolume: The volume is busy, returning for the CO to retry",
+			// volume, so nothing was queued and there is no attachment to wait
+			// for. Returning straight away - what this did before - is correct
+			// but expensive: it hands the whole delay to the CO's retry
+			// backoff, which starts at 1s and doubles, so four rejections cost
+			// ~15s of pure sleeping on top of four round trips. Measured on the
+			// dev cluster, a pod's first attach took 39-40s that way, of which
+			// only a few seconds were IaaS work.
+			//
+			// So wait for the LOCK to clear rather than for an attach to
+			// finish, on a short bounded budget, then issue the attach once
+			// more. This is the one place those two differ: a freshly created
+			// volume clears in ~15-20s, and collapsing four CO rounds into one
+			// RPC is where the time comes back.
+			//
+			// If it does not clear in time the old behaviour resumes exactly -
+			// return, release the inflight entry, let the CO retry - because a
+			// volume held by something genuinely stuck must not keep a handler
+			// parked on it.
+			llog.InfoS("[INFO] - AttachVolume: The volume is busy, waiting for it to clear",
 				"volumeId", pvolumeId, "errorCode", sdkErr.GetStringErrorCode())
 
-			return nil, lserr.ErrVolumeFailedToAttach(pinstanceId, pvolumeId, sdkErr)
+			cleared, werr := s.waitVolumeAttachable(pctx, pinstanceId, pvolumeId)
+			if werr != nil {
+				llog.InfoS("[INFO] - AttachVolume: Still busy, returning for the CO to retry",
+					"volumeId", pvolumeId, "errorCode", sdkErr.GetStringErrorCode())
+
+				return nil, lserr.ErrVolumeFailedToAttach(pinstanceId, pvolumeId, sdkErr)
+			}
+
+			// The wait's predicate also accepts "already attached to us", which
+			// happens when the operation holding the volume WAS our own attach
+			// from an earlier RPC. Nothing left to issue.
+			if cleared.AttachedTheInstance(pinstanceId) {
+				llog.InfoS("[INFO] - AttachVolume: The volume attached while waiting",
+					"volumeId", pvolumeId, "instanceId", pinstanceId)
+
+				return lsentity.NewVolume(cleared), nil
+			}
+
+			// Exactly one more attempt. A second rejection means the volume is
+			// contended beyond what a single RPC should absorb, so it goes back
+			// to the CO rather than looping here.
+			llog.InfoS("[INFO] - AttachVolume: Re-issuing the attach after the volume cleared",
+				"volumeId", pvolumeId, "instanceId", pinstanceId)
+
+			if retryErr := client.VServerGateway().V2().ComputeService().
+				AttachBlockVolume(lsdkComputeV2.NewAttachBlockVolumeRequest(pinstanceId, pvolumeId)); retryErr != nil &&
+				retryErr.GetErrorCode() != lsdkErrs.EcVServerVolumeAlreadyAttachedThisServer {
+				ierr = lserr.ErrVolumeFailedToAttach(pinstanceId, pvolumeId, retryErr)
+				llog.ErrorS(ierr.GetError(),
+					"[ERROR] - AttachVolume: The re-issued attach failed", ierr.GetListParameters()...)
+
+				return nil, ierr
+			}
 		default:
 			ierr = lserr.ErrVolumeFailedToAttach(pinstanceId, pvolumeId, sdkErr)
 			llog.ErrorS(ierr.GetError(), "[ERROR] - AttachVolume: Failed to attach the volume", ierr.GetListParameters()...)

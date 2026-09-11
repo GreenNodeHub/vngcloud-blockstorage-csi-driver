@@ -205,6 +205,62 @@ func (s *cloud) waitDiskAttached(pctx lctx.Context, pinstanceId, pvolumeId strin
 	return lsentity.NewVolume(vol), nil
 }
 
+// waitVolumeAttachable polls until the volume is in a state an attach can be
+// issued against: AVAILABLE, or already attached to this instance and IN-USE.
+//
+// Read-only. It exists for the transient rejection case, where vServer refused
+// the attach because another operation owns the volume - so there is nothing in
+// flight to wait for, only a lock to be released.
+//
+// A volume that ends up IN-USE on a DIFFERENT instance never satisfies the
+// predicate and burns the whole (short) budget before the caller gives up.
+// That is deliberate: distinguishing "busy elsewhere for a moment" from
+// "attached elsewhere for good" would need a second read anyway, and the
+// budget is bounded precisely so the wrong guess is cheap.
+func (s *cloud) waitVolumeAttachable(pctx lctx.Context, pinstanceId, pvolumeId string) (*lsdkEntity.Volume, lserr.IError) {
+	return s.waitVolume(pctx, pvolumeId, volumeWaitSpec{
+		opName:  "waitVolumeAttachable",
+		backoff: volumeBusyBackoff,
+		// A volume that vanished can never become attachable.
+		onNotFound:       notFoundFails,
+		failOnErrorState: true,
+		done: func(pvol *lsdkEntity.Volume) bool {
+			return volumeAttachable(pvol, pinstanceId)
+		},
+		wrap: func(psdkErr lsdkErrs.IError) lserr.IError {
+			return lserr.ErrVolumeFailedToAttach(pinstanceId, pvolumeId, psdkErr)
+		},
+	})
+}
+
+// volumeAttachable reports whether an attach to pinstanceId can be issued now,
+// or is already done.
+//
+// Named rather than inlined in the wait spec so the decision can be tested
+// without a polling loop, the way the other predicates on this path are.
+//
+// Two accepting states, for different reasons:
+//
+//   - AVAILABLE and not attached to us: the lock cleared, issue the attach.
+//   - attached to us AND IN-USE: the operation that held the volume WAS our
+//     attach, arriving from an earlier RPC. Nothing left to issue.
+//
+// A transitional status while attached to us (VmId set, not yet IN-USE) is NOT
+// accepted: ControllerPublishVolume would hand out a devicePath for a block
+// device that does not exist on the VM yet. Same reason AttachVolume's fast
+// path checks IN-USE rather than just VmId.
+func volumeAttachable(pvol *lsdkEntity.Volume, pinstanceId string) bool {
+	if pvol == nil {
+		return false
+	}
+
+	if pvol.AttachedTheInstance(pinstanceId) {
+		return pvol.Status == VolumeInUseStatus
+	}
+
+	return pvol.Status == VolumeAvailableStatus
+}
+
 // waitVolumeDetached polls until the volume is no longer attached to the
 // instance. Read-only - the detach command was already issued once in
 // DetachVolume.

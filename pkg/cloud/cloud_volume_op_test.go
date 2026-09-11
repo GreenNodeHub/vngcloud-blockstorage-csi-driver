@@ -172,6 +172,10 @@ func TestBackoffsStartFastAndDeclareNoCap(t *ltesting.T) {
 		// The snapshot wait has the same two properties for the same reason,
 		// and a tighter caller: csi-snapshotter's default --timeout is 15s.
 		"snapshotOperationBackoff": snapshotOperationBackoff,
+		// The busy wait is the tightest of the four: it holds the (volume,
+		// node) inflight entry while it polls, so its whole budget has to stay
+		// small - see TestVolumeBusyBackoffStaysShortEnoughToHoldInflight.
+		"volumeBusyBackoff": volumeBusyBackoff,
 	} {
 		if bo.Cap != 0 {
 			t.Errorf("%s sets Cap = %v; Cap zeroes Steps and truncates the wait budget", name, bo.Cap)
@@ -226,4 +230,92 @@ func TestErrorConstructorsTolerateNilSdkErr(t *ltesting.T) {
 			}
 		})
 	}
+}
+
+// TestVolumeAttachableAcceptsOnlyIssuableStates pins the predicate behind the
+// bounded busy-wait on the attach path. Getting it wrong in either direction is
+// expensive: too strict and the wait burns its whole budget on a volume that
+// was ready, too loose and ControllerPublishVolume returns a devicePath for a
+// block device the VM does not have yet.
+func TestVolumeAttachableAcceptsOnlyIssuableStates(t *ltesting.T) {
+	for _, tc := range []struct {
+		name string
+		vol  *lsdkEntity.Volume
+		want bool
+	}{
+		{
+			name: "available and unattached: the lock cleared, issue the attach",
+			vol:  rawVolume(VolumeAvailableStatus, ""),
+			want: true,
+		},
+		{
+			name: "already attached to us and IN-USE: nothing left to issue",
+			vol:  rawVolume(VolumeInUseStatus, testInstanceA, testInstanceA),
+			want: true,
+		},
+		{
+			// The case that must NOT be accepted. VmId is set but the volume is
+			// not IN-USE yet, so the device is not on the VM; reporting success
+			// here is how a pod gets a devicePath that does not exist.
+			name: "attached to us but still transitional",
+			vol:  rawVolume("ATTACHING", testInstanceA, testInstanceA),
+			want: false,
+		},
+		{
+			name: "in use by another instance: waiting cannot help",
+			vol:  rawVolume(VolumeInUseStatus, testInstanceB, testInstanceB),
+			want: false,
+		},
+		{
+			name: "still transitional and unattached: the lock has not cleared",
+			vol:  rawVolume("CREATING", ""),
+			want: false,
+		},
+		{
+			name: "error state",
+			vol:  rawVolume(VolumeErrorStatus, ""),
+			want: false,
+		},
+		{
+			name: "nil volume",
+			vol:  nil,
+			want: false,
+		},
+	} {
+		t.Run(tc.name, func(t *ltesting.T) {
+			if got := volumeAttachable(tc.vol, testInstanceA); got != tc.want {
+				t.Errorf("volumeAttachable = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// The busy wait is the only wait that polls while holding the inflight entry
+// for a (volume, node) pair without any IaaS operation in flight. Its budget
+// therefore has to be short enough that a genuinely stuck volume falls back to
+// the CO quickly, and long enough to cover a normal settle - measured at about
+// five seconds on the dev cluster.
+func TestVolumeBusyBackoffStaysShortEnoughToHoldInflight(t *ltesting.T) {
+	polls, total, _ := walkBackoff(volumeBusyBackoff)
+
+	if total > 60*ltime.Second {
+		t.Errorf("total budget = %v; too long to hold the inflight entry", total)
+	}
+	// The observed clear was ~5s; require several times that so a slower
+	// settle still lands inside one RPC.
+	if total < 15*ltime.Second {
+		t.Errorf("total budget = %v; too tight to cover an observed ~5s clear with margin", total)
+	}
+	if polls < 6 {
+		t.Errorf("%d polls; too few to catch an early clear", polls)
+	}
+
+	// And it must be a small fraction of the attacher's own timeout, or the
+	// wait would be the thing that causes the sidecar to give up.
+	const attacherTimeout = 6 * ltime.Minute
+	if total > attacherTimeout/4 {
+		t.Errorf("total budget %v is more than a quarter of the attacher's %v", total, attacherTimeout)
+	}
+
+	t.Logf("volumeBusyBackoff: %d polls, %v total", polls, total.Round(ltime.Millisecond))
 }

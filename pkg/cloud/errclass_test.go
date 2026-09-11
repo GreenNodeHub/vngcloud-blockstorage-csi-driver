@@ -37,6 +37,19 @@ func TestClassify(t *ltesting.T) {
 		{"503 is transient", sdkWrapped(lsdkErrs.EcServiceMaintenance), false, ReasonIaaSServerError},
 		{"in-process is transient", sdkWrapped(lsdkErrs.EcVServerVolumeInProcess), false, ReasonIaaSOperationStalled},
 		{"unknown is transient", sdkWrapped(lsdkErrs.EcUnknownError), false, ReasonIaaSUnknownError},
+		// Both codes are mapped by the SDK for AttachBlockVolume, and neither
+		// had a reason here - a missing volume reported as IaaSUnknownError.
+		{"volume not found", sdkWrapped(lsdkErrs.EcVServerVolumeNotFound), false, ReasonIaaSResourceNotFound},
+		{"server not found", sdkWrapped(lsdkErrs.EcVServerServerNotFound), false, ReasonIaaSResourceNotFound},
+		// The case actually measured on the dev cluster on 10/09/2026: the
+		// SDK's mapping did not match the response body, so a 404 arrived as
+		// the catch-all. The status is what identifies it.
+		{"404 arriving as the catch-all", sdkWrappedStatus(404, lsdkErrs.EcUnexpectedError), false, ReasonIaaSResourceNotFound},
+		// And the discriminations around it must survive: a 5xx and a
+		// no-response still take their own branches, not this one.
+		{"500 as the catch-all is a server error", sdkWrappedStatus(500, lsdkErrs.EcUnexpectedError), false, ReasonIaaSServerError},
+		{"catch-all with no response at all", sdkWrapped(lsdkErrs.EcUnexpectedError), false, ReasonIaaSUnreachable},
+		{"catch-all with an unmodelled 4xx", sdkWrappedStatus(409, lsdkErrs.EcUnexpectedError), false, ReasonIaaSUnknownError},
 	}
 
 	for _, tc := range tcs {
@@ -234,6 +247,81 @@ func TestClassifyTransportFailures(t *ltesting.T) {
 			}
 			if got.Terminal != tc.wantTerminal {
 				t.Errorf("terminal = %v, want %v", got.Terminal, tc.wantTerminal)
+			}
+		})
+	}
+}
+
+// AllErrorReasons drives the pre-created metric series. A reason that Classify
+// can emit but the list omits gets no zero-valued series, so its panel reads
+// "no data" until the first occurrence - the exact problem pre-creation
+// exists to solve. Asserted by driving Classify rather than by re-listing the
+// constants, which would just be the same list twice.
+func TestAllErrorReasonsCoversEveryReasonClassifyEmits(t *ltesting.T) {
+	known := make(map[string]bool, len(AllErrorReasons()))
+	for _, r := range AllErrorReasons() {
+		known[r] = true
+	}
+
+	for _, err := range []lserr.IError{
+		sdkWrapped(lsdkErrs.EcVServerVolumeExceedQuota),
+		sdkWrapped(lsdkErrs.EcVServerVolumeSizeExceedGlobalQuota),
+		sdkWrapped(lsdkErrs.EcVServerServerVolumeAttachQuotaExceeded),
+		sdkWrappedStatus(403, lsdkErrs.EcPermissionDenied),
+		sdkWrappedStatus(429, lsdkErrs.EcPermissionDenied),
+		sdkWrapped(lsdkErrs.EcInternalServerError),
+		sdkWrapped(lsdkErrs.EcVServerVolumeInProcess),
+		sdkWrapped(lsdkErrs.EcVServerVolumeNotFound),
+		sdkWrapped(lsdkErrs.EcVServerServerNotFound),
+		sdkWrappedStatus(404, lsdkErrs.EcUnexpectedError),
+		sdkWrapped(lsdkErrs.EcUnexpectedError),
+		sdkWrapped(lsdkErrs.EcUnknownError),
+	} {
+		reason := Classify(err).Reason
+		if !known[reason] {
+			t.Errorf("Classify emits %q, which AllErrorReasons does not list", reason)
+		}
+	}
+}
+
+// TestClassifyDriverConstructedErrors drives Classify with the error
+// CONSTRUCTORS the driver actually calls, not with synthetic codes.
+//
+// This is the test that would have caught the miss. The first attempt at a
+// not-found reason classified only the SDK's codes, and every table entry
+// built its error with sdkWrapped(...) - so the table proved the set worked
+// on codes that path never produces. The path that fires is
+// getVolumeForAttach re-stamping the SDK's not-found with the driver's own
+// constant, whose VALUE differs ("VServerVolumeNotFound" against
+// "VngCloudVServerVolumeNotFound") while its Go name does not.
+//
+// A live probe with a bogus volume handle still reported IaaSUnknownError
+// after that change shipped. Constructors, not codes.
+func TestClassifyDriverConstructedErrors(t *ltesting.T) {
+	for _, tc := range []struct {
+		name       string
+		err        lserr.IError
+		wantReason string
+	}{
+		{
+			name:       "the read path's not-found, as getVolumeForAttach builds it",
+			err:        lserr.ErrVolumeNotFound("vol-x"),
+			wantReason: ReasonIaaSResourceNotFound,
+		},
+		{
+			name:       "an ERROR-state volume, which has no SDK code at all",
+			err:        lserr.ErrVolumeIsInErrorState("vol-x"),
+			wantReason: ReasonVolumeInErrorState,
+		},
+		{
+			name:       "a detach that the IaaS accepted and never finished",
+			err:        lserr.ErrVolumeFailedToDetach("ins-x", "vol-x", nil),
+			wantReason: ReasonIaaSOperationStalled,
+		},
+	} {
+		t.Run(tc.name, func(t *ltesting.T) {
+			if got := Classify(tc.err).Reason; got != tc.wantReason {
+				t.Errorf("Classify = %q, want %q", got, tc.wantReason)
 			}
 		})
 	}
