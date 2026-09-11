@@ -74,13 +74,26 @@ var (
 
 	// The volume or the node VM is gone as far as the IaaS is concerned.
 	//
-	// Both codes exist and are mapped by the SDK for AttachBlockVolume
-	// (services/compute/v2/server.go), but neither had a reason here, so a
-	// missing volume reported as IaaSUnknownError - the least informative
-	// answer available for one of the most specific failures there is.
+	// THREE codes, not two, and the third is the one that actually fires.
+	//
+	// The SDK's two are mapped for AttachBlockVolume
+	// (services/compute/v2/server.go). But the path that reaches Classify in
+	// practice is getVolumeForAttach's READ: it recognises the SDK's
+	// not-found and re-stamps it with lserr.ErrVolumeNotFound, which carries
+	// the DRIVER's own constant. The two constants share a Go name and differ
+	// in value - lsdkErrs.EcVServerVolumeNotFound is
+	// "VngCloudVServerVolumeNotFound", lserr.EcVServerVolumeNotFound is
+	// "VServerVolumeNotFound" - so a set holding only the SDK's silently
+	// matches nothing on that path.
+	//
+	// Found by probing a bogus volume handle on the dev cluster on
+	// 11/09/2026: the event still read IaaSUnknownError while its own message
+	// said "Volume ... not found". ErrVolumeNotFound takes no sdkErr either,
+	// so there is no sdkErrorCode parameter for effectiveCode to recover.
 	errSetResourceNotFound = lset.NewSet[lsdkErrs.ErrorCode](
 		lsdkErrs.EcVServerVolumeNotFound,
 		lsdkErrs.EcVServerServerNotFound,
+		lserr.EcVServerVolumeNotFound,
 	)
 
 	// The IaaS is mid-operation on this volume - it will clear on its own.

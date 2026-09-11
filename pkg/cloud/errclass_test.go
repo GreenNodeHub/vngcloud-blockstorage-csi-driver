@@ -283,3 +283,46 @@ func TestAllErrorReasonsCoversEveryReasonClassifyEmits(t *ltesting.T) {
 		}
 	}
 }
+
+// TestClassifyDriverConstructedErrors drives Classify with the error
+// CONSTRUCTORS the driver actually calls, not with synthetic codes.
+//
+// This is the test that would have caught the miss. The first attempt at a
+// not-found reason classified only the SDK's codes, and every table entry
+// built its error with sdkWrapped(...) - so the table proved the set worked
+// on codes that path never produces. The path that fires is
+// getVolumeForAttach re-stamping the SDK's not-found with the driver's own
+// constant, whose VALUE differs ("VServerVolumeNotFound" against
+// "VngCloudVServerVolumeNotFound") while its Go name does not.
+//
+// A live probe with a bogus volume handle still reported IaaSUnknownError
+// after that change shipped. Constructors, not codes.
+func TestClassifyDriverConstructedErrors(t *ltesting.T) {
+	for _, tc := range []struct {
+		name       string
+		err        lserr.IError
+		wantReason string
+	}{
+		{
+			name:       "the read path's not-found, as getVolumeForAttach builds it",
+			err:        lserr.ErrVolumeNotFound("vol-x"),
+			wantReason: ReasonIaaSResourceNotFound,
+		},
+		{
+			name:       "an ERROR-state volume, which has no SDK code at all",
+			err:        lserr.ErrVolumeIsInErrorState("vol-x"),
+			wantReason: ReasonVolumeInErrorState,
+		},
+		{
+			name:       "a detach that the IaaS accepted and never finished",
+			err:        lserr.ErrVolumeFailedToDetach("ins-x", "vol-x", nil),
+			wantReason: ReasonIaaSOperationStalled,
+		},
+	} {
+		t.Run(tc.name, func(t *ltesting.T) {
+			if got := Classify(tc.err).Reason; got != tc.wantReason {
+				t.Errorf("Classify = %q, want %q", got, tc.wantReason)
+			}
+		})
+	}
+}
