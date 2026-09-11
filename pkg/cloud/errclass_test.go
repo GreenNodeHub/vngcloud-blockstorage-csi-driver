@@ -37,6 +37,19 @@ func TestClassify(t *ltesting.T) {
 		{"503 is transient", sdkWrapped(lsdkErrs.EcServiceMaintenance), false, ReasonIaaSServerError},
 		{"in-process is transient", sdkWrapped(lsdkErrs.EcVServerVolumeInProcess), false, ReasonIaaSOperationStalled},
 		{"unknown is transient", sdkWrapped(lsdkErrs.EcUnknownError), false, ReasonIaaSUnknownError},
+		// Both codes are mapped by the SDK for AttachBlockVolume, and neither
+		// had a reason here - a missing volume reported as IaaSUnknownError.
+		{"volume not found", sdkWrapped(lsdkErrs.EcVServerVolumeNotFound), false, ReasonIaaSResourceNotFound},
+		{"server not found", sdkWrapped(lsdkErrs.EcVServerServerNotFound), false, ReasonIaaSResourceNotFound},
+		// The case actually measured on the dev cluster on 10/09/2026: the
+		// SDK's mapping did not match the response body, so a 404 arrived as
+		// the catch-all. The status is what identifies it.
+		{"404 arriving as the catch-all", sdkWrappedStatus(404, lsdkErrs.EcUnexpectedError), false, ReasonIaaSResourceNotFound},
+		// And the discriminations around it must survive: a 5xx and a
+		// no-response still take their own branches, not this one.
+		{"500 as the catch-all is a server error", sdkWrappedStatus(500, lsdkErrs.EcUnexpectedError), false, ReasonIaaSServerError},
+		{"catch-all with no response at all", sdkWrapped(lsdkErrs.EcUnexpectedError), false, ReasonIaaSUnreachable},
+		{"catch-all with an unmodelled 4xx", sdkWrappedStatus(409, lsdkErrs.EcUnexpectedError), false, ReasonIaaSUnknownError},
 	}
 
 	for _, tc := range tcs {
@@ -236,5 +249,37 @@ func TestClassifyTransportFailures(t *ltesting.T) {
 				t.Errorf("terminal = %v, want %v", got.Terminal, tc.wantTerminal)
 			}
 		})
+	}
+}
+
+// AllErrorReasons drives the pre-created metric series. A reason that Classify
+// can emit but the list omits gets no zero-valued series, so its panel reads
+// "no data" until the first occurrence - the exact problem pre-creation
+// exists to solve. Asserted by driving Classify rather than by re-listing the
+// constants, which would just be the same list twice.
+func TestAllErrorReasonsCoversEveryReasonClassifyEmits(t *ltesting.T) {
+	known := make(map[string]bool, len(AllErrorReasons()))
+	for _, r := range AllErrorReasons() {
+		known[r] = true
+	}
+
+	for _, err := range []lserr.IError{
+		sdkWrapped(lsdkErrs.EcVServerVolumeExceedQuota),
+		sdkWrapped(lsdkErrs.EcVServerVolumeSizeExceedGlobalQuota),
+		sdkWrapped(lsdkErrs.EcVServerServerVolumeAttachQuotaExceeded),
+		sdkWrappedStatus(403, lsdkErrs.EcPermissionDenied),
+		sdkWrappedStatus(429, lsdkErrs.EcPermissionDenied),
+		sdkWrapped(lsdkErrs.EcInternalServerError),
+		sdkWrapped(lsdkErrs.EcVServerVolumeInProcess),
+		sdkWrapped(lsdkErrs.EcVServerVolumeNotFound),
+		sdkWrapped(lsdkErrs.EcVServerServerNotFound),
+		sdkWrappedStatus(404, lsdkErrs.EcUnexpectedError),
+		sdkWrapped(lsdkErrs.EcUnexpectedError),
+		sdkWrapped(lsdkErrs.EcUnknownError),
+	} {
+		reason := Classify(err).Reason
+		if !known[reason] {
+			t.Errorf("Classify emits %q, which AllErrorReasons does not list", reason)
+		}
 	}
 }

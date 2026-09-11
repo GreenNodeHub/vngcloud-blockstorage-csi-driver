@@ -20,6 +20,7 @@ const (
 	ReasonIaaSThrottled             = "IaaSThrottled"
 	ReasonIaaSServerError           = "IaaSServerError"
 	ReasonIaaSUnreachable           = "IaaSUnreachable"
+	ReasonIaaSResourceNotFound      = "IaaSResourceNotFound"
 	ReasonIaaSOperationStalled      = "IaaSOperationStalled"
 	ReasonIaaSUnknownError          = "IaaSUnknownError"
 )
@@ -41,6 +42,7 @@ func AllErrorReasons() []string {
 		ReasonIaaSThrottled,
 		ReasonIaaSServerError,
 		ReasonIaaSUnreachable,
+		ReasonIaaSResourceNotFound,
 		ReasonIaaSOperationStalled,
 		ReasonIaaSUnknownError,
 	}
@@ -68,6 +70,17 @@ var (
 	)
 	errSetAttachQuotaExceeded = lset.NewSet[lsdkErrs.ErrorCode](
 		lsdkErrs.EcVServerServerVolumeAttachQuotaExceeded,
+	)
+
+	// The volume or the node VM is gone as far as the IaaS is concerned.
+	//
+	// Both codes exist and are mapped by the SDK for AttachBlockVolume
+	// (services/compute/v2/server.go), but neither had a reason here, so a
+	// missing volume reported as IaaSUnknownError - the least informative
+	// answer available for one of the most specific failures there is.
+	errSetResourceNotFound = lset.NewSet[lsdkErrs.ErrorCode](
+		lsdkErrs.EcVServerVolumeNotFound,
+		lsdkErrs.EcVServerServerNotFound,
 	)
 
 	// The IaaS is mid-operation on this volume - it will clear on its own.
@@ -104,10 +117,10 @@ func Classify(perr lserr.IError) Class {
 	// that error code alone would turn throttling into a permanent "permission
 	// denied" - the exact misreading that once misdirected an lb-controller
 	// incident diagnosis. We must check the raw statusCode instead.
-	if isThrottledStatus(perr, lhttp.StatusTooManyRequests) {
+	if hasResponseStatusCode(perr, lhttp.StatusTooManyRequests) {
 		return Class{Reason: ReasonIaaSThrottled}
 	}
-	if isThrottledStatus(perr, lhttp.StatusForbidden) {
+	if hasResponseStatusCode(perr, lhttp.StatusForbidden) {
 		return Class{Terminal: true, Reason: ReasonIaaSPermissionDenied}
 	}
 
@@ -116,6 +129,13 @@ func Classify(perr lserr.IError) Class {
 		return Class{Reason: ReasonIaaSServerError}
 	case errSetOperationStalled.ContainsOne(code):
 		return Class{Reason: ReasonIaaSOperationStalled}
+	case errSetResourceNotFound.ContainsOne(code):
+		// NOT terminal. A 404 moments after a create is eventual consistency,
+		// and this file's standing rule is that calling a transient error
+		// terminal costs more than the reverse: a terminal class trips the
+		// detach breaker on the first failure. Only the label changes here;
+		// retry behaviour is exactly as before.
+		return Class{Reason: ReasonIaaSResourceNotFound}
 	case code == ecCsiClientRateLimited:
 		return Class{Reason: ReasonIaaSThrottled}
 	case code == lserr.EcVServerVolumeFailedToDetach:
@@ -146,6 +166,15 @@ func Classify(perr lserr.IError) Class {
 		if !hasResponseStatus(perr) {
 			return Class{Reason: ReasonIaaSUnreachable}
 		}
+		// A 404 that arrived as the SDK's catch-all rather than as
+		// VolumeNotFound/ServerNotFound. Measured on the dev cluster on
+		// 10/09/2026: one attach failed with code UnknownError and status 404,
+		// so the SDK's own mapping did not match the response body. The status
+		// says what the code could not, and the meaning is the same as the
+		// mapped codes above.
+		if hasResponseStatusCode(perr, lhttp.StatusNotFound) {
+			return Class{Reason: ReasonIaaSResourceNotFound}
+		}
 		// A response arrived with a status that is neither 5xx nor one of the
 		// codes handled above - a 4xx we do not model. Retrying it unchanged
 		// will not help, but it stays non-terminal: calling a transient error
@@ -166,7 +195,7 @@ func Classify(perr lserr.IError) Class {
 // every detach failure - quota, 500, busy volume - into one indistinguishable
 // value, and Classify answered ReasonIaaSUnknownError for all of them. That is
 // the same trap one level up from the SDK's own flattening of 429 and 403 into
-// EcPermissionDenied - see the comment on the isThrottledStatus checks in
+// EcPermissionDenied - see the comment on the hasResponseStatusCode checks in
 // Classify: a code that has already lost a distinction cannot be used to make
 // it.
 func effectiveCode(perr lserr.IError) lsdkErrs.ErrorCode {
@@ -205,9 +234,14 @@ func hasServerErrorStatus(perr lserr.IError) bool {
 	return ok && status >= lhttp.StatusInternalServerError
 }
 
-// isThrottledStatus reads the raw statusCode the SDK stashes in the error
-// parameters. Same access path isThrottled() uses in ratelimit.go.
-func isThrottledStatus(perr lserr.IError, pstatus int) bool {
+// hasResponseStatusCode reads the raw statusCode the SDK stashes in the error
+// parameters and compares it. Same access path isThrottled() uses in
+// ratelimit.go.
+//
+// Used for three statuses now - 429, 403 and 404 - which is why it is not
+// named after any one of them. It was isThrottledStatus while it served only
+// the 429/403 split, and that name had already stopped being true.
+func hasResponseStatusCode(perr lserr.IError, pstatus int) bool {
 	raw, ok := perr.GetParameters()["statusCode"]
 	if !ok {
 		return false
