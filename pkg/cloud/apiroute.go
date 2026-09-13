@@ -65,6 +65,13 @@ var staticRouteSegments = map[string]struct{}{
 	segVolumeTypes:      {},
 	"volume_default_id": {},
 	"volume_type_zones": {},
+	// identity (accounts-api). Named because this is the call that matters
+	// most when the driver can do nothing: on 11/09/2026 the auth token
+	// endpoint returned 401 then 429 for two and a half hours and the only
+	// label it had was "unknown" - the one call an operator needed to see by
+	// name was anonymous.
+	"auth":  {},
+	"token": {},
 	// portal/v1 + portal/v2
 	"projects":  {},
 	"detail":    {},
@@ -190,5 +197,6 @@ func KnownAPIRoutes() []RouteMethod {
 		{routeVolumeTypes, lhttp.MethodGet},                                               // GetListVolumeTypes
 		{"zones", lhttp.MethodGet},                                                        // ListZones
 		{"projects/" + routeIDPlaceholder + "/detail", lhttp.MethodGet},                   // GetPortalInfo
+		{"auth/token", lhttp.MethodPost},                                                  // SDK authentication and reauth
 	}
 }

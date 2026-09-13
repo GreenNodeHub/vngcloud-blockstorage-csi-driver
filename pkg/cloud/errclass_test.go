@@ -50,6 +50,14 @@ func TestClassify(t *ltesting.T) {
 		{"500 as the catch-all is a server error", sdkWrappedStatus(500, lsdkErrs.EcUnexpectedError), false, ReasonIaaSServerError},
 		{"catch-all with no response at all", sdkWrapped(lsdkErrs.EcUnexpectedError), false, ReasonIaaSUnreachable},
 		{"catch-all with an unmodelled 4xx", sdkWrappedStatus(409, lsdkErrs.EcUnexpectedError), false, ReasonIaaSUnknownError},
+		// 401 arrives in two shapes depending on whether the SDK's mapping
+		// matched, so it is recognised by status, not by code. Terminal
+		// because the SDK has already retried through its reauth hook by the
+		// time the error gets here.
+		{"401 as the catch-all", sdkWrappedStatus(401, lsdkErrs.EcUnexpectedError), true, ReasonIaaSAuthFailed},
+		{"401 mapped to permission denied", sdkWrappedStatus(401, lsdkErrs.EcPermissionDenied), true, ReasonIaaSAuthFailed},
+		// And 401 must not swallow the neighbouring statuses.
+		{"403 stays permission denied", sdkWrappedStatus(403, lsdkErrs.EcUnexpectedError), true, ReasonIaaSPermissionDenied},
 	}
 
 	for _, tc := range tcs {
@@ -274,6 +282,7 @@ func TestAllErrorReasonsCoversEveryReasonClassifyEmits(t *ltesting.T) {
 		sdkWrapped(lsdkErrs.EcVServerVolumeNotFound),
 		sdkWrapped(lsdkErrs.EcVServerServerNotFound),
 		sdkWrappedStatus(404, lsdkErrs.EcUnexpectedError),
+		sdkWrappedStatus(401, lsdkErrs.EcUnexpectedError),
 		sdkWrapped(lsdkErrs.EcUnexpectedError),
 		sdkWrapped(lsdkErrs.EcUnknownError),
 	} {

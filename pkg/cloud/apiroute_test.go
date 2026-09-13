@@ -65,6 +65,15 @@ func TestNormalizeAPIRouteCollapsesIdentifiers(t *ltesting.T) {
 			want: routeVolumeTypes,
 		},
 		{
+			// The identity endpoint. Its host and path prefix differ from
+			// vServer's entirely, which is why the anchor rule matters here:
+			// the route starts at the first whitelisted segment, not at a
+			// fixed offset.
+			name: "auth token on the identity endpoint",
+			url:  "https://iamapis.vngcloud.vn/accounts-api/v2/auth/token",
+			want: "auth/token",
+		},
+		{
 			name: "portal info",
 			url:  "https://iam.vngcloud.vn/portal/v1/projects/p-991/detail",
 			want: "projects/{id}/detail",

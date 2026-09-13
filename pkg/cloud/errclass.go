@@ -21,6 +21,7 @@ const (
 	ReasonIaaSServerError           = "IaaSServerError"
 	ReasonIaaSUnreachable           = "IaaSUnreachable"
 	ReasonIaaSResourceNotFound      = "IaaSResourceNotFound"
+	ReasonIaaSAuthFailed            = "IaaSAuthFailed"
 	ReasonIaaSOperationStalled      = "IaaSOperationStalled"
 	ReasonIaaSUnknownError          = "IaaSUnknownError"
 )
@@ -43,6 +44,7 @@ func AllErrorReasons() []string {
 		ReasonIaaSServerError,
 		ReasonIaaSUnreachable,
 		ReasonIaaSResourceNotFound,
+		ReasonIaaSAuthFailed,
 		ReasonIaaSOperationStalled,
 		ReasonIaaSUnknownError,
 	}
@@ -135,6 +137,26 @@ func Classify(perr lserr.IError) Class {
 	}
 	if hasResponseStatusCode(perr, lhttp.StatusForbidden) {
 		return Class{Terminal: true, Reason: ReasonIaaSPermissionDenied}
+	}
+	// 401 is the most actionable failure this driver can report and it was
+	// arriving as IaaSUnknownError. Measured on the dev cluster on
+	// 11/09/2026: IAM began rejecting the driver's clientId, the project
+	// lookup failed 15 times with status 401, every CreateVolume failed, and
+	// the reason on the PVC said "unknown".
+	//
+	// Checked by STATUS, beside the 429/403 pair, because the two shapes this
+	// arrives in carry different codes: the SDK's catch-all when its own
+	// mapping misses, or EcPermissionDenied when it matches. Only the status
+	// is common to both.
+	//
+	// Terminal. The SDK already retries once through its reauth hook
+	// (client/http.go), so a 401 that reaches here means re-authentication
+	// itself failed - the credential is wrong or revoked, and no amount of
+	// retrying fixes that. On the detach path terminal trips the breaker on
+	// the first failure, which is exactly right: stop hammering an endpoint
+	// that is rejecting this identity.
+	if hasResponseStatusCode(perr, lhttp.StatusUnauthorized) {
+		return Class{Terminal: true, Reason: ReasonIaaSAuthFailed}
 	}
 
 	switch {
