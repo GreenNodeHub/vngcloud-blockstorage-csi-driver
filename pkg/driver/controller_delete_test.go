@@ -13,6 +13,7 @@ import (
 	lsentity "github.com/vngcloud/vngcloud-blockstorage-csi-driver/pkg/cloud/entity"
 	lserr "github.com/vngcloud/vngcloud-blockstorage-csi-driver/pkg/cloud/errors"
 	lsinternal "github.com/vngcloud/vngcloud-blockstorage-csi-driver/pkg/driver/internal"
+	lsk8s "github.com/vngcloud/vngcloud-blockstorage-csi-driver/pkg/k8s"
 	lsmetrics "github.com/vngcloud/vngcloud-blockstorage-csi-driver/pkg/metrics"
 )
 
@@ -188,5 +189,57 @@ func TestDeleteVolumeReportsAFailedSnapshotListing(t *ltesting.T) {
 	m := findSample(t, lsmetrics.IaaSErrors, labels)
 	if m == nil || m.GetCounter().GetValue() != before+1 {
 		t.Errorf("iaas_errors_total{op=delete,reason=IaaSUnreachable} did not move")
+	}
+}
+
+// ctxSpyK8s records the context emitVolumeEvent hands to the Kubernetes client.
+//
+// The fake clientset ignores context cancellation entirely, so a test that just
+// passes a cancelled ctx through DeleteVolume PASSES on the broken code - I
+// wrote that test first and it proved nothing. What can be asserted is the
+// property that actually matters: by the time the lookup runs, the context must
+// no longer be one the sidecar has already cancelled.
+type ctxSpyK8s struct {
+	lsk8s.IKubernetes
+	lookupCtxErr error
+	sawLookup    bool
+}
+
+func (s *ctxSpyK8s) FindPersistentVolumeByHandle(pctx lctx.Context, phandle string) (*lsentity.PersistentVolume, lserr.IError) {
+	s.sawLookup = true
+	s.lookupCtxErr = pctx.Err()
+
+	return s.IKubernetes.FindPersistentVolumeByHandle(pctx, phandle)
+}
+
+// The sidecar cancels the RPC on its own timeout - 60s for csi-provisioner -
+// and that is exactly when an IaaS is slow or unreachable, i.e. exactly when the
+// event matters. Looking the PV up with the request context meant the lookup
+// failed and the event was dropped, silently, at V(2).
+//
+// Measured on the dev cluster on 16/09/2026: with vServer blocked,
+// iaas_errors_total{op="delete",reason="IaaSUnreachable"} incremented while no
+// event ever appeared on the PV.
+func TestVolumeEventLookupDoesNotUseTheCancelledRequestContext(t *ltesting.T) {
+	const volumeID = "vol-a"
+	svc, _ := newDetachTestService(volumeID)
+	spy := &ctxSpyK8s{IKubernetes: svc.k8sClient}
+	svc.k8sClient = spy
+	svc.inFlight = lsinternal.NewInFlight()
+	svc.cloud = deleteFailingCloud{err: lserr.ErrVolumeFailedToDelete(volumeID, nil)}
+
+	ctx, cancel := lctx.WithCancel(lctx.Background())
+	cancel() // the sidecar has already given up
+
+	if _, err := svc.DeleteVolume(ctx, &lcsi.DeleteVolumeRequest{VolumeId: volumeID}); err == nil {
+		t.Fatal("expected the delete to fail")
+	}
+
+	if !spy.sawLookup {
+		t.Fatal("emitVolumeEvent never looked the PV up")
+	}
+	if spy.lookupCtxErr != nil {
+		t.Errorf("PV lookup ran with an already-cancelled context (%v); the event would be dropped against a real apiserver",
+			spy.lookupCtxErr)
 	}
 }
