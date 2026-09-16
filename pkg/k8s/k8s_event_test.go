@@ -185,3 +185,23 @@ func containsAll(phaystack string, pneedles ...string) bool {
 
 	return true
 }
+
+// Every event method reads its object from the apiserver before recording, so a
+// cancelled context means the read fails and the event is dropped - silently.
+// The callers are CSI handlers whose context the sidecar cancels on ITS timeout,
+// which is exactly the situation the event exists to describe.
+func TestEventContextSurvivesACancelledCaller(t *ltesting.T) {
+	ctx, cancel := lctx.WithCancel(lctx.Background())
+	cancel()
+
+	got, release := EventContext(ctx)
+	defer release()
+
+	if err := got.Err(); err != nil {
+		t.Fatalf("EventContext still carries the caller's cancellation: %v", err)
+	}
+
+	if _, ok := got.Deadline(); !ok {
+		t.Error("EventContext has no deadline; a failing handler could be held open by its own reporting")
+	}
+}
