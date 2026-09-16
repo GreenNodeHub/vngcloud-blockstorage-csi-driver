@@ -12,6 +12,19 @@ jobs:
   build:
     name: GoReleaser build
     runs-on: ubuntu-latest
+    # GO_RELEASER_GITHUB_TOKEN lives in the `production` environment, alongside
+    # the registry credentials build_prod.yml uses. A job that declares no
+    # environment sees only repository- and organization-level secrets, so
+    # without this line the token resolves to an empty string and GoReleaser
+    # exits with "missing GITHUB_TOKEN" before doing any work.
+    #
+    # That is exactly what happened on the v1.5.0 and v1.5.1 tags: both runs
+    # failed after ~20s at the env step, having built nothing.
+    #
+    # Note this also puts releases behind whatever protection rules the
+    # `production` environment carries - a required reviewer there means every
+    # tag push waits for an approval.
+    environment: production
     steps:
       - name: Check out code into the Go module directory
         uses: actions/checkout@v4
