@@ -358,6 +358,14 @@ func (s *controllerService) DeleteVolume(pctx lctx.Context, preq *lcsi.DeleteVol
 	lstSnapshots, ierr := s.cloud.ListSnapshots(volumeID, 1, 10)
 	if ierr != nil {
 		llog.ErrorS(ierr.GetError(), "[ERROR] - DeleteVolume: Failed to list snapshots", "volumeId", volumeID)
+		// Reported for the same reason the delete below is: this is the FIRST
+		// IaaS call the delete path makes, so during an IaaS outage it is the
+		// one that fails, and leaving it silent recreates exactly the blind
+		// spot the reporting was added to remove. Verified on the dev cluster
+		// on 16/09/2026 - with vServer blocked, every DeleteVolume died here
+		// and neither an event nor a metric appeared.
+		s.reportDeleteIaaSError(pctx, volumeID, ierr)
+
 		return nil, ErrFailedToListSnapshot(volumeID)
 	}
 
