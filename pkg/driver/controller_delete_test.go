@@ -20,10 +20,15 @@ import (
 // ListSnapshots answers empty, which is what the handler checks first.
 type deleteFailingCloud struct {
 	lscloud.Cloud
-	err lserr.IError
+	err     lserr.IError
+	listErr lserr.IError
 }
 
 func (s deleteFailingCloud) ListSnapshots(_ string, _, _ int) (*lsentity.ListSnapshots, lserr.IError) {
+	if s.listErr != nil {
+		return nil, s.listErr
+	}
+
 	// The embedded pointer must be non-nil: IsEmpty reads s.Items through it.
 	return &lsentity.ListSnapshots{ListSnapshots: &lsdkEntity.ListSnapshots{}}, nil
 }
@@ -141,5 +146,47 @@ func TestDeleteVolumeCountsUnderItsOwnOpLabel(t *ltesting.T) {
 	}
 	if got := m.GetCounter().GetValue(); got != before+1 {
 		t.Errorf("counter = %v, want %v", got, before+1)
+	}
+}
+
+// ListSnapshots is the FIRST IaaS call DeleteVolume makes, so during an IaaS
+// outage it is the one that fails - the delete below is never reached. Measured
+// on the dev cluster on 16/09/2026: with vServer blocked, every DeleteVolume
+// died here, and the first version of this reporting left that branch silent,
+// reproducing the very blind spot it was meant to close.
+func TestDeleteVolumeReportsAFailedSnapshotListing(t *ltesting.T) {
+	const volumeID = "vol-a"
+	lsmetrics.InitializeRecorder()
+
+	svc, events := newDetachTestService(volumeID)
+	svc.inFlight = lsinternal.NewInFlight()
+	svc.cloud = deleteFailingCloud{
+		listErr: lserr.NewError(new(lsdkErrs.SdkError).
+			WithErrorCode(lsdkErrs.EcUnexpectedError).
+			WithMessage("dial tcp: i/o timeout")),
+	}
+
+	labels := map[string]string{
+		lsmetrics.LabelOp:     lsmetrics.OpDelete,
+		lsmetrics.LabelReason: lscloud.ReasonIaaSUnreachable,
+	}
+	before := 0.0
+	if m := findSample(t, lsmetrics.IaaSErrors, labels); m != nil {
+		before = m.GetCounter().GetValue()
+	}
+
+	if _, err := svc.DeleteVolume(lctx.Background(), &lcsi.DeleteVolumeRequest{VolumeId: volumeID}); err == nil {
+		t.Fatal("expected the delete to fail at the snapshot listing")
+	}
+
+	msg := drainOneEvent(t, events)
+	want := "Warning " + lscloud.ReasonIaaSUnreachable + " "
+	if !lstrings.HasPrefix(msg, want) {
+		t.Errorf("event = %q, want it to start with %q", msg, want)
+	}
+
+	m := findSample(t, lsmetrics.IaaSErrors, labels)
+	if m == nil || m.GetCounter().GetValue() != before+1 {
+		t.Errorf("iaas_errors_total{op=delete,reason=IaaSUnreachable} did not move")
 	}
 }
