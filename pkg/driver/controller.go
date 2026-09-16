@@ -682,6 +682,22 @@ func (s *controllerService) reportAttachIaaSError(pctx lctx.Context, pvolumeID, 
 // the PVC if it still exists). Every failure is swallowed: reporting a problem
 // must never create one.
 func (s *controllerService) emitVolumeEvent(pctx lctx.Context, pvolumeID, peventType, preason, pmessage string) {
+	// Detach from the caller's cancellation, keeping its values.
+	//
+	// The sidecar cancels the RPC on its own timeout - 60s for csi-provisioner,
+	// 6m for the attacher - and that is precisely when the IaaS is slow or
+	// unreachable, i.e. precisely when this event is the thing an operator
+	// needs. Looking the PV up with the request context meant List failed on a
+	// dead context, the function returned at V(2), and the event was dropped
+	// without a trace.
+	//
+	// Measured on the dev cluster on 16/09/2026: with vServer blocked,
+	// iaas_errors_total{op="delete",reason="IaaSUnreachable"} incremented while
+	// no event ever reached the PV. The metric survived because it needs no
+	// apiserver call; the event did not.
+	pctx, cancel := lsk8s.EventContext(pctx)
+	defer cancel()
+
 	pv, ierr := s.k8sClient.FindPersistentVolumeByHandle(pctx, pvolumeID)
 	if ierr != nil || pv == nil || pv.PersistentVolume == nil {
 		llog.V(2).InfoS("[DEBUG] - emitVolumeEvent: no PV for this volume, skipping event",
