@@ -226,15 +226,23 @@ func TestStartupSeriesControllerModeCoversEveryRouteAndReason(t *ltesting.T) {
 	reasons := lscloud.AllErrorReasons()
 
 	// Per route: 1 duration histogram + throttles + shed + 4 outcomes = 7.
-	// Per reason: 1 breaker trip + 3 iaas_errors ops = 4. Plus the 2 gate series.
-	want := len(routes)*7 + len(reasons)*4 + 2
+	// Per reason: 1 breaker trip + 4 iaas_errors ops = 5. Plus the 2 gate series.
+	want := len(routes)*7 + len(reasons)*5 + 2
 	if len(specs) != want {
 		t.Errorf("startupSeries(ControllerMode) has %d specs, want %d", len(specs), want)
 	}
 
+	// Every op for every reason, delete included - the op that had no series at
+	// all until QC hit a volume stuck DETACHING on 15/09/2026 and found nothing
+	// to query.
 	for _, reason := range reasons {
-		if !hasSpec(specs, lsmetrics.IaaSErrors, map[string]string{lsmetrics.LabelOp: lsmetrics.OpDetach, lsmetrics.LabelReason: reason}) {
-			t.Errorf("no pre-created iaas_errors series for reason %q", reason)
+		for _, op := range []string{
+			lsmetrics.OpCreate, lsmetrics.OpAttach, lsmetrics.OpDetach, lsmetrics.OpDelete,
+		} {
+			if !hasSpec(specs, lsmetrics.IaaSErrors,
+				map[string]string{lsmetrics.LabelOp: op, lsmetrics.LabelReason: reason}) {
+				t.Errorf("no pre-created iaas_errors series for op=%q reason=%q", op, reason)
+			}
 		}
 	}
 

@@ -366,11 +366,11 @@ func (s *controllerService) DeleteVolume(pctx lctx.Context, preq *lcsi.DeleteVol
 		return nil, ErrDeleteVolumeHavingSnapshots(volumeID)
 	}
 
-	if err := s.cloud.DeleteVolume(pctx, volumeID); err != nil {
-		if err != nil {
-			llog.ErrorS(err.GetError(), "[ERROR] - DeleteVolume: Failed to delete volume", "volumeID", volumeID)
-			return nil, ErrFailedToDeleteVolume(volumeID)
-		}
+	if ierr := s.cloud.DeleteVolume(pctx, volumeID); ierr != nil {
+		llog.ErrorS(ierr.GetError(), "[ERROR] - DeleteVolume: Failed to delete volume", "volumeID", volumeID)
+		s.reportDeleteIaaSError(pctx, volumeID, ierr)
+
+		return nil, ErrFailedToDeleteVolume(volumeID)
 	}
 
 	return &lcsi.DeleteVolumeResponse{}, nil
@@ -626,6 +626,34 @@ func (s *controllerService) onDetachSucceeded(
 // codes.ResourceExhausted is the better answer is a separate question that
 // needs a live experiment, exactly like the Internal-vs-Aborted question on
 // the detach path.
+// reportDeleteIaaSError classifies a DeleteVolume failure and makes it visible.
+//
+// The delete path had no reporting at all: it logged and returned
+// ErrFailedToDeleteVolume, so a volume the IaaS could not release left a PV
+// sitting in Released with nothing on it to say why. QC hit exactly that on
+// 15/09/2026 - a volume stuck DETACHING at vServer, DeleteVolume retried 37
+// times by csi-provisioner, and the only way to diagnose it was reading driver
+// logs line by line.
+//
+// Deliberately event + metric only, no breaker. The detach breaker exists to
+// stop RE-ISSUING a mutating command into a stuck volume. This loop issues no
+// mutation until the volume is already deletable - ListSnapshots, one read, and
+// the poll are all reads - so what it wastes is read quota, not write storms,
+// and what was actually missing was the ability to see it.
+func (s *controllerService) reportDeleteIaaSError(pctx lctx.Context, pvolumeID string, pierr lserr.IError) {
+	if pierr == nil {
+		return
+	}
+
+	cls := lscloud.Classify(pierr)
+	lsmetrics.Recorder().IncreaseCount(lsmetrics.IaaSErrors, lsmetrics.IaaSErrorsHelp, map[string]string{
+		lsmetrics.LabelOp: lsmetrics.OpDelete, lsmetrics.LabelReason: cls.Reason,
+	})
+
+	msg := lfmt.Sprintf("Delete %s failed: %s", pvolumeID, pierr.GetMessage())
+	s.emitVolumeEvent(pctx, pvolumeID, lcoreV1.EventTypeWarning, cls.Reason, msg)
+}
+
 func (s *controllerService) reportAttachIaaSError(pctx lctx.Context, pvolumeID, pnodeID string, pierr lserr.IError) {
 	if pierr == nil {
 		return
