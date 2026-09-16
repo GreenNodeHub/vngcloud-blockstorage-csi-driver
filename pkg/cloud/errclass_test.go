@@ -327,6 +327,14 @@ func TestClassifyDriverConstructedErrors(t *ltesting.T) {
 			err:        lserr.ErrVolumeFailedToDetach("ins-x", "vol-x", nil),
 			wantReason: ReasonIaaSOperationStalled,
 		},
+		{
+			// Same condition from the other end: the volume never became
+			// deletable because it was stuck DETACHING at the IaaS. Reached
+			// Classify as IaaSUnknownError until 16/09/2026.
+			name:       "a delete whose wait gave up because the volume never settled",
+			err:        lserr.ErrVolumeFailedToDelete("vol-x", nil),
+			wantReason: ReasonIaaSOperationStalled,
+		},
 	} {
 		t.Run(tc.name, func(t *ltesting.T) {
 			if got := Classify(tc.err).Reason; got != tc.wantReason {

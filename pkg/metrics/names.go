@@ -115,6 +115,7 @@ const (
 	OpCreate = "create"
 	OpAttach = "attach"
 	OpDetach = "detach"
+	OpDelete = "delete"
 )
 
 // StatusNone is the status label for a call that got no HTTP response at all -

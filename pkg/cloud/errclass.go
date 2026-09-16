@@ -173,10 +173,18 @@ func Classify(perr lserr.IError) Class {
 		return Class{Reason: ReasonIaaSResourceNotFound}
 	case code == ecCsiClientRateLimited:
 		return Class{Reason: ReasonIaaSThrottled}
-	case code == lserr.EcVServerVolumeFailedToDetach:
-		// No SDK code at all: the wait helpers build this one with
-		// psdkErr == nil, meaning the IaaS ACCEPTED the detach and the volume
-		// then never finished. That is exactly the 23-hour incident's error.
+	case code == lserr.EcVServerVolumeFailedToDetach,
+		code == lserr.EcVServerVolumeFailedToDelete:
+		// No SDK code at all: the wait helpers build these with psdkErr == nil,
+		// meaning the IaaS ACCEPTED the operation and the volume then never
+		// finished. The detach form is exactly the 23-hour incident's error.
+		//
+		// The delete form is the same condition seen from the other end, and it
+		// was reaching here as IaaSUnknownError until 16/09/2026: QC hit a
+		// volume stuck DETACHING at vServer, so waitVolumeDeletable never saw
+		// CanDelete and gave up on the context. "The IaaS is still working on
+		// it" is the accurate reading, and the useful one - it is what tells an
+		// operator to look at vServer rather than at the driver.
 		return Class{Reason: ReasonIaaSOperationStalled}
 	case code == lsdkErrs.EcUnexpectedError:
 		// The SDK's catch-all, and by volume the most common IaaS failure there
