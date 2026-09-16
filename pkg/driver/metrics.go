@@ -126,7 +126,9 @@ func startupSeries(pmode Mode) []seriesSpec {
 			Labels: map[string]string{lsmetrics.LabelReason: reason},
 		})
 
-		for _, op := range []string{lsmetrics.OpCreate, lsmetrics.OpAttach, lsmetrics.OpDetach} {
+		for _, op := range []string{
+			lsmetrics.OpCreate, lsmetrics.OpAttach, lsmetrics.OpDetach, lsmetrics.OpDelete,
+		} {
 			specs = append(specs, seriesSpec{
 				Kind: seriesCounter, Name: lsmetrics.IaaSErrors, Help: lsmetrics.IaaSErrorsHelp,
 				Labels: map[string]string{lsmetrics.LabelOp: op, lsmetrics.LabelReason: reason},

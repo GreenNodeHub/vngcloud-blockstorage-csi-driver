@@ -2,6 +2,7 @@ package k8s
 
 import (
 	lctx "context"
+	ltime "time"
 
 	lcoreV1 "k8s.io/api/core/v1"
 	lmetav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -65,10 +66,36 @@ func (s *kubernetes) GetPersistentVolume(pctx lctx.Context, pname string) (*lsen
 
 }
 
+// EventContext detaches from the caller's cancellation while keeping its
+// values, and bounds the apiserver calls an event costs.
+//
+// Every event method here reads the object from the apiserver before recording
+// against it, so a cancelled context means the read fails and the event is
+// dropped. The callers are CSI handlers, and their context is cancelled by the
+// sidecar on ITS timeout - 60s for csi-provisioner, 6m for the attacher - which
+// is exactly when the IaaS is slow or unreachable, i.e. exactly when the event
+// is the thing an operator needs.
+//
+// Measured on the dev cluster on 16/09/2026: with vServer blocked, the delete
+// path's metric incremented while no event ever reached the PV. The metric
+// survived because it needs no apiserver call.
+//
+// The timeout is small on purpose: the caller is a failing handler, and
+// reporting must not become the thing that holds it open.
+func EventContext(pctx lctx.Context) (lctx.Context, lctx.CancelFunc) {
+	return lctx.WithTimeout(lctx.WithoutCancel(pctx), eventEmitTimeout)
+}
+
+// eventEmitTimeout bounds one event's apiserver work.
+const eventEmitTimeout = 10 * ltime.Second
+
 func (s *kubernetes) PersistentVolumeClaimEventWarning(pctx lctx.Context, pnamespace, pname, preason, pmessage string) {
 	if pnamespace == "" || pname == "" {
 		return
 	}
+
+	pctx, cancel := EventContext(pctx)
+	defer cancel()
 
 	pvc, err := s.GetPersistentVolumeClaimByName(pctx, pnamespace, pname)
 	if err != nil || pvc == nil {
@@ -82,6 +109,9 @@ func (s *kubernetes) PersistentVolumeClaimEventNormal(pctx lctx.Context, pnamesp
 		return
 	}
 
+	pctx, cancel := EventContext(pctx)
+	defer cancel()
+
 	pvc, err := s.GetPersistentVolumeClaimByName(pctx, pnamespace, pname)
 	if err != nil || pvc == nil {
 		return
@@ -94,6 +124,9 @@ func (s *kubernetes) PersistentVolumeEventWarning(pctx lctx.Context, pname, prea
 		return
 	}
 
+	pctx, cancel := EventContext(pctx)
+	defer cancel()
+
 	pvc, err := s.GetPersistentVolume(pctx, pname)
 	if err != nil || pvc == nil {
 		return
@@ -105,6 +138,9 @@ func (s *kubernetes) PersistentVolumeEventNormal(pctx lctx.Context, pname, preas
 	if pname == "" {
 		return
 	}
+
+	pctx, cancel := EventContext(pctx)
+	defer cancel()
 
 	pvc, err := s.GetPersistentVolume(pctx, pname)
 	if err != nil || pvc == nil {

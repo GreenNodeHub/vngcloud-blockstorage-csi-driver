@@ -358,6 +358,14 @@ func (s *controllerService) DeleteVolume(pctx lctx.Context, preq *lcsi.DeleteVol
 	lstSnapshots, ierr := s.cloud.ListSnapshots(volumeID, 1, 10)
 	if ierr != nil {
 		llog.ErrorS(ierr.GetError(), "[ERROR] - DeleteVolume: Failed to list snapshots", "volumeId", volumeID)
+		// Reported for the same reason the delete below is: this is the FIRST
+		// IaaS call the delete path makes, so during an IaaS outage it is the
+		// one that fails, and leaving it silent recreates exactly the blind
+		// spot the reporting was added to remove. Verified on the dev cluster
+		// on 16/09/2026 - with vServer blocked, every DeleteVolume died here
+		// and neither an event nor a metric appeared.
+		s.reportDeleteIaaSError(pctx, volumeID, ierr)
+
 		return nil, ErrFailedToListSnapshot(volumeID)
 	}
 
@@ -366,11 +374,11 @@ func (s *controllerService) DeleteVolume(pctx lctx.Context, preq *lcsi.DeleteVol
 		return nil, ErrDeleteVolumeHavingSnapshots(volumeID)
 	}
 
-	if err := s.cloud.DeleteVolume(pctx, volumeID); err != nil {
-		if err != nil {
-			llog.ErrorS(err.GetError(), "[ERROR] - DeleteVolume: Failed to delete volume", "volumeID", volumeID)
-			return nil, ErrFailedToDeleteVolume(volumeID)
-		}
+	if ierr := s.cloud.DeleteVolume(pctx, volumeID); ierr != nil {
+		llog.ErrorS(ierr.GetError(), "[ERROR] - DeleteVolume: Failed to delete volume", "volumeID", volumeID)
+		s.reportDeleteIaaSError(pctx, volumeID, ierr)
+
+		return nil, ErrFailedToDeleteVolume(volumeID)
 	}
 
 	return &lcsi.DeleteVolumeResponse{}, nil
@@ -626,6 +634,34 @@ func (s *controllerService) onDetachSucceeded(
 // codes.ResourceExhausted is the better answer is a separate question that
 // needs a live experiment, exactly like the Internal-vs-Aborted question on
 // the detach path.
+// reportDeleteIaaSError classifies a DeleteVolume failure and makes it visible.
+//
+// The delete path had no reporting at all: it logged and returned
+// ErrFailedToDeleteVolume, so a volume the IaaS could not release left a PV
+// sitting in Released with nothing on it to say why. QC hit exactly that on
+// 15/09/2026 - a volume stuck DETACHING at vServer, DeleteVolume retried 37
+// times by csi-provisioner, and the only way to diagnose it was reading driver
+// logs line by line.
+//
+// Deliberately event + metric only, no breaker. The detach breaker exists to
+// stop RE-ISSUING a mutating command into a stuck volume. This loop issues no
+// mutation until the volume is already deletable - ListSnapshots, one read, and
+// the poll are all reads - so what it wastes is read quota, not write storms,
+// and what was actually missing was the ability to see it.
+func (s *controllerService) reportDeleteIaaSError(pctx lctx.Context, pvolumeID string, pierr lserr.IError) {
+	if pierr == nil {
+		return
+	}
+
+	cls := lscloud.Classify(pierr)
+	lsmetrics.Recorder().IncreaseCount(lsmetrics.IaaSErrors, lsmetrics.IaaSErrorsHelp, map[string]string{
+		lsmetrics.LabelOp: lsmetrics.OpDelete, lsmetrics.LabelReason: cls.Reason,
+	})
+
+	msg := lfmt.Sprintf("Delete %s failed: %s", pvolumeID, pierr.GetMessage())
+	s.emitVolumeEvent(pctx, pvolumeID, lcoreV1.EventTypeWarning, cls.Reason, msg)
+}
+
 func (s *controllerService) reportAttachIaaSError(pctx lctx.Context, pvolumeID, pnodeID string, pierr lserr.IError) {
 	if pierr == nil {
 		return
@@ -646,6 +682,22 @@ func (s *controllerService) reportAttachIaaSError(pctx lctx.Context, pvolumeID, 
 // the PVC if it still exists). Every failure is swallowed: reporting a problem
 // must never create one.
 func (s *controllerService) emitVolumeEvent(pctx lctx.Context, pvolumeID, peventType, preason, pmessage string) {
+	// Detach from the caller's cancellation, keeping its values.
+	//
+	// The sidecar cancels the RPC on its own timeout - 60s for csi-provisioner,
+	// 6m for the attacher - and that is precisely when the IaaS is slow or
+	// unreachable, i.e. precisely when this event is the thing an operator
+	// needs. Looking the PV up with the request context meant List failed on a
+	// dead context, the function returned at V(2), and the event was dropped
+	// without a trace.
+	//
+	// Measured on the dev cluster on 16/09/2026: with vServer blocked,
+	// iaas_errors_total{op="delete",reason="IaaSUnreachable"} incremented while
+	// no event ever reached the PV. The metric survived because it needs no
+	// apiserver call; the event did not.
+	pctx, cancel := lsk8s.EventContext(pctx)
+	defer cancel()
+
 	pv, ierr := s.k8sClient.FindPersistentVolumeByHandle(pctx, pvolumeID)
 	if ierr != nil || pv == nil || pv.PersistentVolume == nil {
 		llog.V(2).InfoS("[DEBUG] - emitVolumeEvent: no PV for this volume, skipping event",
