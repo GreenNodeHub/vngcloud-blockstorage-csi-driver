@@ -58,8 +58,8 @@ func (s *deleteSpyCloud) DeleteVolume(_ lctx.Context, _ string) lserr.IError {
 // stuckVolume is the shape QC hit: vServer still lists the machine, so
 // CanDelete stays false and waitVolumeDeletable polls until the sidecar's
 // context expires.
-func stuckVolume() *lsdkEntity.Volume {
-	return &lsdkEntity.Volume{VmId: "ins-1", AttachedMachine: []string{"ins-1"}, Status: "DETACHING"}
+func stuckVolume(pinstanceID string) *lsdkEntity.Volume {
+	return &lsdkEntity.Volume{VmId: pinstanceID, AttachedMachine: []string{pinstanceID}, Status: "DETACHING"}
 }
 
 func freeVolume() *lsdkEntity.Volume {
@@ -81,7 +81,7 @@ func TestDeleteVolumePausedIssuesNoDeleteAndOnlyOneRead(t *ltesting.T) {
 	const volumeID = "vol-a"
 	svc, _ := newDetachTestService(volumeID)
 	svc.inFlight = lsinternal.NewInFlight()
-	spy := &deleteSpyCloud{getVol: stuckVolume()}
+	spy := &deleteSpyCloud{getVol: stuckVolume("ins-1")}
 	svc.cloud = spy
 
 	tripDeleteBreaker(svc, volumeID)
