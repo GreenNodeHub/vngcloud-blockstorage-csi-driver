@@ -202,7 +202,7 @@ func TestStartupSeriesSkipsControllerSeriesInNodeMode(t *ltesting.T) {
 
 	for _, spec := range node {
 		switch spec.Name {
-		case lsmetrics.DetachBreakerTrips, lsmetrics.IaaSErrors,
+		case lsmetrics.DetachBreakerTrips, lsmetrics.DeleteBreakerTrips, lsmetrics.IaaSErrors,
 			lsmetrics.CreateGateWaiting, lsmetrics.CreateGateWaitSeconds:
 			t.Errorf("node mode would pre-create controller-only series %q", spec.Name)
 		}
@@ -226,8 +226,9 @@ func TestStartupSeriesControllerModeCoversEveryRouteAndReason(t *ltesting.T) {
 	reasons := lscloud.AllErrorReasons()
 
 	// Per route: 1 duration histogram + throttles + shed + 4 outcomes = 7.
-	// Per reason: 1 breaker trip + 4 iaas_errors ops = 5. Plus the 2 gate series.
-	want := len(routes)*7 + len(reasons)*5 + 2
+	// Per reason: 2 breaker trips (detach, delete) + 4 iaas_errors ops = 6.
+	// Plus the 2 gate series.
+	want := len(routes)*7 + len(reasons)*6 + 2
 	if len(specs) != want {
 		t.Errorf("startupSeries(ControllerMode) has %d specs, want %d", len(specs), want)
 	}

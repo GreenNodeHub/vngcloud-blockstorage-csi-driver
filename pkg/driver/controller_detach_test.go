@@ -53,6 +53,7 @@ func newDetachTestService(pvolumeID string) (*controllerService, chan string) {
 
 	svc := &controllerService{
 		detachBreaker: lsinternal.NewBreaker(),
+		deleteBreaker: lsinternal.NewBreaker(),
 		k8sClient:     lsk8s.NewKubernetes(client, rec),
 	}
 

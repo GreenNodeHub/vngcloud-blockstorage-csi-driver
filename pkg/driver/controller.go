@@ -32,6 +32,7 @@ type controllerService struct {
 	inFlight            *lsinternal.InFlight
 	createGate          *lsinternal.Semaphore
 	detachBreaker       *lsinternal.Breaker
+	deleteBreaker       *lsinternal.Breaker
 	modifyVolumeManager *modifyVolumeManager
 	driverOptions       *DriverOptions
 	k8sClient           lsk8s.IKubernetes
@@ -72,6 +73,7 @@ func newControllerService(pdriOpts *DriverOptions) controllerService {
 		inFlight:            lsinternal.NewInFlight(),
 		createGate:          lsinternal.NewSemaphore(pdriOpts.maxConcurrentVolumeCreates),
 		detachBreaker:       lsinternal.NewBreaker(),
+		deleteBreaker:       lsinternal.NewBreaker(),
 		driverOptions:       pdriOpts,
 		modifyVolumeManager: newModifyVolumeManager(),
 		k8sClient:           lsk8s.NewKubernetes(k8sClient, recorder),
@@ -354,6 +356,42 @@ func (s *controllerService) DeleteVolume(pctx lctx.Context, preq *lcsi.DeleteVol
 		s.inFlight.Delete(volumeID)
 	}()
 
+	now := ltime.Now()
+	s.evictStaleDeleteState(now)
+	bkey := lsinternal.BreakerKey{VolumeID: volumeID}
+
+	// While the breaker is open this call reads one volume and returns. The
+	// cost it removes is not a write storm - the delete path commands nothing
+	// until the volume is already deletable - it is the WAIT: waitVolumeDeletable
+	// polls until the sidecar's context expires, so every csi-provisioner retry
+	// burned a full 60s worker slot doing nothing. QC hit 37 such retries on
+	// 15/09/2026 against a volume vServer had parked in DETACHING.
+	if s.deleteBreaker.Allow(bkey, now) == lsinternal.ProbeOnly {
+		deletable, ierr := s.probeVolumeDeletable(volumeID)
+		switch {
+		case ierr != nil:
+			// A failed probe says nothing about whether the IaaS would accept
+			// a delete, so it must NOT advance the backoff - but an operator
+			// needs to know the driver has lost sight of this volume.
+			llog.InfoS("[INFO] - DeleteVolume: delete paused by breaker, could not confirm state",
+				"volumeID", volumeID, "error", ierr.GetError())
+
+			return nil, ErrDeleteVolumePaused(volumeID)
+		case !deletable:
+			llog.InfoS("[INFO] - DeleteVolume: delete paused by breaker, volume still not deletable",
+				"volumeID", volumeID)
+
+			return nil, ErrDeleteVolumePaused(volumeID)
+		}
+
+		// Deletable again: fall through and spend this call on a real attempt
+		// rather than making the volume wait out the rest of the backoff step.
+		// Nothing is being forced past the breaker - the state the breaker was
+		// waiting for is the state the probe just read.
+		llog.InfoS("[INFO] - DeleteVolume: volume became deletable while paused, attempting for real",
+			"volumeID", volumeID)
+	}
+
 	// So the volume MUST NOT truly be deleted if it has at least one snapshot
 	lstSnapshots, ierr := s.cloud.ListSnapshots(volumeID, 1, 10)
 	if ierr != nil {
@@ -364,22 +402,28 @@ func (s *controllerService) DeleteVolume(pctx lctx.Context, preq *lcsi.DeleteVol
 		// spot the reporting was added to remove. Verified on the dev cluster
 		// on 16/09/2026 - with vServer blocked, every DeleteVolume died here
 		// and neither an event nor a metric appeared.
-		s.reportDeleteIaaSError(pctx, volumeID, ierr)
+		s.onDeleteFailed(pctx, volumeID, bkey, now, ierr)
 
 		return nil, ErrFailedToListSnapshot(volumeID)
 	}
 
 	if !lstSnapshots.IsEmpty() {
+		// Deliberately not a breaker failure. The volume is not stuck; it is
+		// held by a snapshot the user owns, and no amount of backoff changes
+		// that. Feeding it to the breaker would report a vServer stall that
+		// is not happening.
 		llog.ErrorS(nil, "[ERROR] - DeleteVolume: CANNOT delete this volume because of having snapshots", "volumeId", volumeID)
 		return nil, ErrDeleteVolumeHavingSnapshots(volumeID)
 	}
 
 	if ierr := s.cloud.DeleteVolume(pctx, volumeID); ierr != nil {
 		llog.ErrorS(ierr.GetError(), "[ERROR] - DeleteVolume: Failed to delete volume", "volumeID", volumeID)
-		s.reportDeleteIaaSError(pctx, volumeID, ierr)
+		s.onDeleteFailed(pctx, volumeID, bkey, now, ierr)
 
 		return nil, ErrFailedToDeleteVolume(volumeID)
 	}
+
+	s.onDeleteSucceeded(pctx, volumeID, bkey, now)
 
 	return &lcsi.DeleteVolumeResponse{}, nil
 }
@@ -648,18 +692,124 @@ func (s *controllerService) onDetachSucceeded(
 // mutation until the volume is already deletable - ListSnapshots, one read, and
 // the poll are all reads - so what it wastes is read quota, not write storms,
 // and what was actually missing was the ability to see it.
-func (s *controllerService) reportDeleteIaaSError(pctx lctx.Context, pvolumeID string, pierr lserr.IError) {
+func (s *controllerService) onDeleteFailed(
+	pctx lctx.Context, pvolumeID string, pkey lsinternal.BreakerKey, pnow ltime.Time, pierr lserr.IError,
+) {
 	if pierr == nil {
 		return
 	}
 
 	cls := lscloud.Classify(pierr)
+
+	// Read BEFORE Failure: an entry exists from failure #1 onwards, so
+	// "not tracked yet" is the only way to recognise the first failure, and
+	// Failure creates the entry.
+	_, tracked, _ := s.deleteBreaker.Since(pkey, pnow)
+	first := !tracked
+
+	tripped, stepped := s.deleteBreaker.Failure(pkey, cls.Terminal, pnow)
+	stuck, _, isTripped := s.deleteBreaker.Since(pkey, pnow)
+
+	// Unconditional: this is the series that covers failures the breaker has
+	// not opened on yet.
 	lsmetrics.Recorder().IncreaseCount(lsmetrics.IaaSErrors, lsmetrics.IaaSErrorsHelp, map[string]string{
 		lsmetrics.LabelOp: lsmetrics.OpDelete, lsmetrics.LabelReason: cls.Reason,
 	})
 
-	msg := lfmt.Sprintf("Delete %s failed: %s", pvolumeID, pierr.GetMessage())
-	s.emitVolumeEvent(pctx, pvolumeID, lcoreV1.EventTypeWarning, cls.Reason, msg)
+	// Only meaningful once the breaker has actually opened. Publishing a
+	// series born at 0s for every transient failure is churn with no signal,
+	// and each one then has to be evicted again.
+	if isTripped {
+		lsmetrics.Recorder().SetGauge(lsmetrics.DeletePendingSeconds, lsmetrics.DeletePendingSecondsHelp,
+			stuck.Seconds(), map[string]string{lsmetrics.LabelVolumeID: pvolumeID})
+	}
+
+	if tripped || stepped {
+		lsmetrics.Recorder().IncreaseCount(lsmetrics.DeleteBreakerTrips, lsmetrics.DeleteBreakerTripsHelp,
+			map[string]string{lsmetrics.LabelReason: cls.Reason})
+	}
+
+	// Events on the first failure and on each escalation, not on every retry.
+	// The first one preserves what v1.5.1 already gave an operator - a reason
+	// on the PV as soon as the delete fails - and the escalations say the
+	// driver has stopped trying for a while. The 35 retries in between add no
+	// information and each event costs a full unpaginated
+	// PersistentVolumes().List() (see FindPersistentVolumeByHandle).
+	if !first && !tripped && !stepped {
+		return
+	}
+
+	if first {
+		s.emitVolumeEvent(pctx, pvolumeID, lcoreV1.EventTypeWarning, cls.Reason,
+			lfmt.Sprintf("Delete %s failed: %s", pvolumeID, pierr.GetMessage()))
+
+		return
+	}
+
+	msg := lfmt.Sprintf(
+		"Delete of %s keeps failing (%s, stuck for %s). Pausing IaaS delete calls; state will still be probed on each retry.",
+		pvolumeID, cls.Reason, stuck.Round(ltime.Second),
+	)
+	s.emitVolumeEvent(pctx, pvolumeID, lcoreV1.EventTypeWarning, "VolumeDeleteStalled", msg)
+}
+
+// onDeleteSucceeded clears the breaker, drops the gauge series so nothing
+// keeps alerting, and says so out loud if the volume had been stuck.
+func (s *controllerService) onDeleteSucceeded(
+	pctx lctx.Context, pvolumeID string, pkey lsinternal.BreakerKey, pnow ltime.Time,
+) {
+	stuck, _, wasTripped := s.deleteBreaker.Since(pkey, pnow)
+	s.deleteBreaker.Success(pkey)
+
+	// Unconditional: deleting an absent series is a cheap no-op, and it is the
+	// one call that must not be skipped by mistake.
+	lsmetrics.Recorder().DeleteGauge(lsmetrics.DeletePendingSeconds,
+		map[string]string{lsmetrics.LabelVolumeID: pvolumeID})
+
+	// Only a volume that actually tripped gets a recovery event - and note it
+	// lands on a PV that is about to disappear, so it is for the audit trail
+	// and for anyone watching, not for later inspection.
+	if !wasTripped {
+		return
+	}
+
+	msg := lfmt.Sprintf("Delete of %s succeeded after being stuck for %s.", pvolumeID, stuck.Round(ltime.Second))
+	s.emitVolumeEvent(pctx, pvolumeID, lcoreV1.EventTypeNormal, "VolumeDeleteRecovered", msg)
+}
+
+// evictStaleDeleteState drops every delete-breaker entry no traffic has
+// touched for twice the capped step, and clears the gauge series that went
+// with it. Same reasoning as evictStaleDetachState: a frozen gauge would make
+// the "stuck > 30m" alert fire forever on a healthy cluster.
+//
+// A volume reaches this state routinely, and more often than a detach pair
+// does: once the delete finally succeeds the PV is gone, and if an operator
+// removes the PV by hand instead, no further DeleteVolume call ever arrives.
+func (s *controllerService) evictStaleDeleteState(pnow ltime.Time) {
+	for _, stale := range s.deleteBreaker.EvictStale(pnow) {
+		lsmetrics.Recorder().DeleteGauge(lsmetrics.DeletePendingSeconds,
+			map[string]string{lsmetrics.LabelVolumeID: stale.VolumeID})
+	}
+}
+
+// probeVolumeDeletable reads whether a delete would get anywhere, commanding
+// nothing. Used while the delete breaker is open.
+//
+// A volume that is GONE counts as deletable, not as an error: DeleteVolume is
+// required to be idempotent, and letting the call through means it returns OK
+// and csi-provisioner finally releases the PV. Refusing here instead would
+// pause a volume that no longer exists for up to two hours.
+func (s *controllerService) probeVolumeDeletable(pvolumeID string) (bool, lserr.IError) {
+	vol, ierr := s.cloud.GetVolume(pvolumeID)
+	if ierr != nil {
+		if lscloud.Classify(ierr).Reason == lscloud.ReasonIaaSResourceNotFound {
+			return true, nil
+		}
+
+		return false, ierr
+	}
+
+	return vol.CanDelete(), nil
 }
 
 func (s *controllerService) reportAttachIaaSError(pctx lctx.Context, pvolumeID, pnodeID string, pierr lserr.IError) {
