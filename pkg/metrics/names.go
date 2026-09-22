@@ -25,6 +25,20 @@ const (
 	DetachBreakerTrips     = "vks_csi_detach_breaker_trips_total"
 	DetachBreakerTripsHelp = "detach circuit-breaker trips and backoff-step increases, by error reason"
 
+	// Gauge: seconds a volume has been failing to delete, measured from its
+	// first failure. The delete-side twin of DetachPendingSeconds, and the
+	// series that was missing when QC hit a volume stuck DETACHING at vServer
+	// on 15/09/2026: the error counter said the delete had failed 37 times but
+	// nothing said for how long, so there was nothing to alert on.
+	//
+	// Keyed by volume alone - unlike detach there is no node in the operation.
+	DeletePendingSeconds     = "vks_csi_volume_delete_pending_seconds"
+	DeletePendingSecondsHelp = "seconds a volume has been failing to delete, measured from its first failure"
+
+	// Counter: delete-breaker trips and backoff-step increases, by reason.
+	DeleteBreakerTrips     = "vks_csi_delete_breaker_trips_total"
+	DeleteBreakerTripsHelp = "delete circuit-breaker trips and backoff-step increases, by error reason"
+
 	// Counter: every classified IaaS error, by CSI operation and reason. This
 	// is the CSI-operation view; the api_request_* family below is the
 	// per-HTTP-call view. They answer different questions and neither replaces
