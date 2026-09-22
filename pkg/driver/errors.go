@@ -128,6 +128,24 @@ var (
 		return lstt.Errorf(lcodes.Internal, "CANNOT delete volume %s", pvolumeID)
 	}
 
+	// ErrDeleteVolumePaused is the return while the delete circuit-breaker is
+	// open. Like ErrDetachVolumePaused it exists so the message does not claim
+	// an attempt the driver deliberately did not make - this string is what an
+	// operator reads on the PV.
+	//
+	// codes.Internal deliberately matches ErrFailedToDeleteVolume: that is the
+	// code csi-provisioner is known to retry this path on, and the driver
+	// needs the retries to keep probing. It must NOT be FailedPrecondition or
+	// anything else untested here - which code makes the provisioner stop
+	// retrying, or drop the PV, is not provable from this source tree.
+	ErrDeleteVolumePaused = func(pvolumeID string) error {
+		return lstt.Errorf(lcodes.Internal,
+			"Delete of volume %s is PAUSED by the delete circuit-breaker after repeated IaaS failures; no delete "+
+				"command was issued on this call. Volume state is still being probed on every retry and a real "+
+				"attempt resumes when the current backoff step expires",
+			pvolumeID)
+	}
+
 	ErrFailedToListVolumeByName = func(pvolName string) error {
 		return lstt.Errorf(lcodes.Internal, "CANNOT list volume by name %s", pvolName)
 	}

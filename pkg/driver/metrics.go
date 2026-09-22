@@ -124,6 +124,10 @@ func startupSeries(pmode Mode) []seriesSpec {
 			Kind: seriesCounter, Name: lsmetrics.DetachBreakerTrips,
 			Help:   lsmetrics.DetachBreakerTripsHelp,
 			Labels: map[string]string{lsmetrics.LabelReason: reason},
+		}, seriesSpec{
+			Kind: seriesCounter, Name: lsmetrics.DeleteBreakerTrips,
+			Help:   lsmetrics.DeleteBreakerTripsHelp,
+			Labels: map[string]string{lsmetrics.LabelReason: reason},
 		})
 
 		for _, op := range []string{
@@ -162,9 +166,10 @@ func startupSeries(pmode Mode) []seriesSpec {
 // third label is the SDK's error code, which has no enumerable set worth
 // pinning here.
 //
-// detach_pending_seconds is deliberately NOT pre-created. Its absence is
-// meaningful - it means no (volume, node) pair is stuck - and pre-creating it
-// would need placeholder label values that match no real volume.
+// detach_pending_seconds and delete_pending_seconds are deliberately NOT
+// pre-created. Their absence is meaningful - it means nothing is stuck - and
+// pre-creating them would need placeholder label values that match no real
+// volume.
 func InitializeStartupMetrics(pmode Mode) {
 	rec := lsmetrics.Recorder()
 	if rec == nil {
