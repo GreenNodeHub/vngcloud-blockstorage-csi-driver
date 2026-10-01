@@ -35,3 +35,4 @@ TestResults.xml
 # are scratch for one change - they go stale the moment the code lands and
 # would otherwise be reviewed as if they were still true.
 docs/
+/bin/
