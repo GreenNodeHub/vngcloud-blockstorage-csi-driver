@@ -80,8 +80,35 @@ functional:
 
 # kept for compatibility reasons.
 fmt: check
-lint: check
 vet: check
+
+# Pinned golangci-lint, installed into ./bin (never system-wide). Keep the
+# version in sync with .github/workflows/ci.yml and the `check` target above.
+LOCALBIN ?= $(CURDIR)/bin
+GOLANGCI_LINT_VERSION ?= v2.12.2
+GOLANGCI_LINT := $(LOCALBIN)/golangci-lint-$(GOLANGCI_LINT_VERSION)
+# Lint only code changed since this revision (same idea as only-new-issues in CI).
+LINT_BASE ?= origin/main
+
+$(GOLANGCI_LINT):
+	@mkdir -p $(LOCALBIN)
+	GOBIN=$(LOCALBIN) go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
+	mv $(LOCALBIN)/golangci-lint $(GOLANGCI_LINT)
+
+# Lint ONLY new code (diff against $(LINT_BASE)); pre-existing findings do not
+# fail. Uses the same version and .golangci.yml as CI. Use `make check` for a
+# full-repo run.
+lint: $(GOLANGCI_LINT) ## Lint new code only (vs LINT_BASE, default origin/main)
+	$(GOLANGCI_LINT) run --new-from-rev=$(LINT_BASE) ./...
+
+# Quick pre-finish check: go vet (as in CI) + lint on new code + unit tests.
+# Unit tests use the same package set as `make unit` (the sanity/tests
+# exclusion is kept) with -short and without -v. Nothing here talks to real
+# cloud APIs or a cluster; this repo has no envtest/integration/e2e packages.
+# The long runtime of a cold `make test` is Go compilation, not test time.
+verify-fast: lint ## Fast check: go vet + lint (new code) + unit tests
+	go vet ./...
+	go test -short -tags=unit $(shell go list ./... | sed -e '/sanity/ { N; d; }' | sed -e '/tests/ {N; d;}')
 
 cover: work
 	go test -tags=unit $(shell go list ./...) -cover
@@ -195,4 +222,4 @@ dist: build-cross
 	)
 
 .PHONY: bindep build clean cover work docs fmt functional lint realclean \
-	relnotes test translation version build-cross dist codeclimate
+	verify-fast check unit relnotes test translation version build-cross dist codeclimate
